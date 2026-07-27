@@ -2326,7 +2326,7 @@ app.post("/api/orders/:id/void", requireAnyPermission("request_voids", "approve_
         if (logErr.code !== "ER_NO_SUCH_TABLE") throw logErr;
       }
       await db.execute(
-        "UPDATE orders SET voided_at = NOW(), voided_by = ?, voided_by_name = ?, subtotal = 0, discount = 0, tax = 0, total = 0 WHERE id = ?",
+        "UPDATE orders SET status = 'voided', voided_at = NOW(), voided_by = ?, voided_by_name = ?, subtotal = 0, discount = 0, tax = 0, total = 0 WHERE id = ?",
         [manager.id, manager.name, orderId]
       );
       await db.execute(
@@ -2404,7 +2404,7 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
       if (!liveItems.length) {
         try {
           await db.execute(
-            "UPDATE orders SET voided_at = NOW(), voided_by = ?, voided_by_name = ?, subtotal = 0, discount = 0, tax = 0, total = 0 WHERE id = ? AND voided_at IS NULL",
+            "UPDATE orders SET status = 'voided', voided_at = NOW(), voided_by = ?, voided_by_name = ?, subtotal = 0, discount = 0, tax = 0, total = 0 WHERE id = ? AND voided_at IS NULL",
             [manager.id, manager.name, orderId]
           );
         } catch (e) {
@@ -2717,9 +2717,15 @@ app.post("/api/tables/:tableId/bill-preview", requireAnyPermission("accept_payme
     }
 
     const isSplitPayment = Array.isArray(splits) && splits.length >= 2;
-    const paymentMethodVal = isSplitPayment ? "split_payment" : normalizePaymentMethod(paymentMethod || "cash");
-    const complimentaryByOrder = await loadComplimentaryByOrder(db, pending.map((o) => o.id));
     const settings = await loadBillSettings(db);
+    const posSettings = await loadPosFinancialSettings(db);
+    for (const o of pending) {
+      const fresh = await updateOrderTotalsFromItems(db, o.id, posSettings);
+      o.subtotal = fresh.subtotal;
+      o.tax = fresh.tax;
+      o.total = fresh.total;
+    }
+    const complimentaryByOrder = await loadComplimentaryByOrder(db, pending.map((o) => o.id));
     const bill = computeTableBillTotals({
       pending,
       complimentaryByOrder,
@@ -2836,6 +2842,13 @@ app.post("/api/tables/:tableId/pay-all", requireAnyPermission("accept_payments",
       } catch (e2) {
         if (e2.code !== "ER_BAD_FIELD_ERROR") throw e2;
       }
+    }
+    const posSettings = await loadPosFinancialSettings(conn);
+    for (const o of pending) {
+      const fresh = await updateOrderTotalsFromItems(conn, o.id, posSettings);
+      o.subtotal = fresh.subtotal;
+      o.tax = fresh.tax;
+      o.total = fresh.total;
     }
     const complimentaryByOrder = await loadComplimentaryByOrder(conn, pendingIds);
 
@@ -4460,11 +4473,13 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
           : uniqEmp.length <= 2
             ? uniqEmp.join(", ")
             : `${uniqEmp[0]} · +${uniqEmp.length - 1}`;
-      const allPaid = ordList.every((x) => x.status === "paid");
-      const anyPending = ordList.some((x) => x.status === "pending");
-      const sessionStatus = head.sessionStatus || (allPaid ? "closed" : anyPending ? "open" : "closed");
-      // Session stays pending while any order is unpaid; paid only when every order is paid.
-      const status = allPaid ? "paid" : "pending";
+      const activeOrders = ordList.filter((x) => x.status !== "voided");
+      const allPaid = activeOrders.length === 0 || activeOrders.every((x) => x.status === "paid");
+      const anyPending = activeOrders.some((x) => x.status === "pending");
+      const isSessionClosed = head.sessionStatus === "closed" || (!anyPending && activeOrders.length > 0);
+      const sessionStatus = head.sessionStatus || (isSessionClosed ? "closed" : "open");
+      // Session displays paid when all active orders are paid or session is closed.
+      const status = allPaid || head.sessionStatus === "closed" ? "paid" : "pending";
       const openedMs = head.sessionOpenedAt ? new Date(head.sessionOpenedAt).getTime() : Math.min(...ordList.map((x) => x.timeMs));
       const closedMs = head.sessionClosedAt
         ? new Date(head.sessionClosedAt).getTime()

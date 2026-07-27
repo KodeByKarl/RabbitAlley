@@ -2004,12 +2004,14 @@ export default function POSTableOrder() {
 
           {/* Order Items - Scrollable */}
           <div className="space-y-2 flex-1 overflow-y-auto mb-4 min-h-0 max-h-[40vh] lg:max-h-none">
-            {orderItems.length === 0 ? (
+            {orderItems.filter((item) => !item.isVoided).length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">
                 {canAddItems ? "Tap products to add to order" : "No items in this order."}
               </p>
             ) : (
-              orderItems.map((item) => (
+              orderItems
+                .filter((item) => !item.isVoided)
+                .map((item) => (
                 <div
                   key={item.id ?? `${item.productId}:${item.servedBy ?? ""}`}
                   className={`flex items-center justify-between p-2 rounded-lg ${
