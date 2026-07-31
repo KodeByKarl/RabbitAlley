@@ -172,7 +172,7 @@ CREATE TABLE IF NOT EXISTS orders (
   table_id VARCHAR(16) DEFAULT NULL,
   table_visit_id INT UNSIGNED DEFAULT NULL,
   session_id BIGINT UNSIGNED DEFAULT NULL,
-  status ENUM('pending','paid') NOT NULL DEFAULT 'pending',
+  status ENUM('pending','paid','voided','cancelled') NOT NULL DEFAULT 'pending',
   payment_method VARCHAR(32) DEFAULT NULL,  -- cash, gcash, debit, credit, bank
   subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
   discount DECIMAL(12,2) NOT NULL DEFAULT 0,
@@ -782,35 +782,38 @@ ON DUPLICATE KEY UPDATE name = VALUES(name);
 -- Default password for all accounts: "password". All assigned to branch_id 1.
 -- ============================================================================
 
-INSERT INTO users (employee_id, name, email, password_hash, role_id, branch_id, nickname, allowance, hourly, active) VALUES
+INSERT INTO users (id, employee_id, name, email, password_hash, role_id, branch_id, nickname, allowance, hourly, active) VALUES
 -- MANAGERS / ADMIN (role_id = 1)
-('MGR001', 'Angelo Val Morante', 'gelo@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Gelo', 500, 0, 1),
-('MGR002', 'Jedd Kris Paul Patio', 'jedd@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Jedd', 500, 0, 1),
-('MGR003', 'Len Gabriel Liwanag', 'gab@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Gab', 500, 0, 1),
-('MGR004', 'Martin Tolentino', 'monk@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Monk', 500, 0, 1),
+(1, 'MGR001', 'Angelo Val Morante', 'gelo@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Gelo', 500, 0, 1),
+(2, 'MGR002', 'Jedd Kris Paul Patio', 'jedd@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Jedd', 500, 0, 1),
+(3, 'MGR003', 'Len Gabriel Liwanag', 'gab@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Gab', 500, 0, 1),
+(4, 'MGR004', 'Martin Tolentino', 'monk@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Monk', 500, 0, 1),
+(5, 'GL', 'Len Gabriel Liwanag (GL)', 'gl@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'GL', 500, 0, 1),
+(6, 'ADMIN', 'System Administrator', 'admin@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Admin', 500, 0, 1),
+(7, 'MGR', 'Default Manager Account', 'mgr@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 1, 1, 'Manager', 500, 0, 1),
 
 -- WAITERS (role_id = 2 - Staff)
-('WTR001', 'Christian', 'christian@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Christian', 350, 50, 1),
-('WTR002', 'Jhovi', 'jhovi@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Jhovi', 350, 50, 1),
-('WTR003', 'Keith', 'keith@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Keith', 350, 50, 1),
-('WTR004', 'Marlon', 'marlon@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Marlon', 350, 50, 1),
+(8, 'WTR001', 'Christian', 'christian@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Christian', 350, 50, 1),
+(9, 'WTR002', 'Jhovi', 'jhovi@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Jhovi', 350, 50, 1),
+(10, 'WTR003', 'Keith', 'keith@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Keith', 350, 50, 1),
+(11, 'WTR004', 'Marlon', 'marlon@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Marlon', 350, 50, 1),
 
 -- WAITRESS (role_id = 2 - Staff)
-('WTS001', 'Nikka', 'nikka@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Nikka', 350, 50, 1),
-('WTS002', 'Yuna', 'yuna@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Yuna', 350, 50, 1),
-('WTS003', 'Kath', 'kath@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Kath', 350, 50, 1),
-('WTS004', 'Joy', 'joy@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Joy', 350, 50, 1),
+(12, 'WTS001', 'Nikka', 'nikka@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Nikka', 350, 50, 1),
+(13, 'WTS002', 'Yuna', 'yuna@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Yuna', 350, 50, 1),
+(14, 'WTS003', 'Kath', 'kath@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Kath', 350, 50, 1),
+(15, 'WTS004', 'Joy', 'joy@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Joy', 350, 50, 1),
 
 -- BARTENDERS (role_id = 3 - Operations Staff / Cashier)
-('BAR001', 'Toyskie', 'toyskie@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 3, 1, 'Toyskie', 400, 60, 1),
-('BAR002', 'Romgel', 'romgel@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 3, 1, 'Romgel', 400, 60, 1),
+(16, 'BAR001', 'Toyskie', 'toyskie@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 3, 1, 'Toyskie', 400, 60, 1),
+(17, 'BAR002', 'Romgel', 'romgel@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 3, 1, 'Romgel', 400, 60, 1),
 
 -- MODELS / LADIES (role_id = 2 - Staff; these are the LD hostesses selectable in the POS)
-('MDL001', 'Angelica Santos',  'angelica@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Angel',  300, 0, 1),
-('MDL002', 'Bianca Reyes',     'bianca@rabbitalley.local',   '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Bianca', 300, 0, 1),
-('MDL003', 'Clarisse Dela Cruz','clarisse@rabbitalley.local','$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Cla',    300, 0, 1),
-('MDL004', 'Diana Villanueva', 'diana@rabbitalley.local',    '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Diana',  300, 0, 1),
-('MDL005', 'Elena Cruz',       'elena@rabbitalley.local',    '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Elena',  300, 0, 1)
+(18, 'MDL001', 'Angelica Santos',  'angelica@rabbitalley.local', '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Angel',  300, 0, 1),
+(19, 'MDL002', 'Bianca Reyes',     'bianca@rabbitalley.local',   '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Bianca', 300, 0, 1),
+(20, 'MDL003', 'Clarisse Dela Cruz','clarisse@rabbitalley.local','$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Cla',    300, 0, 1),
+(21, 'MDL004', 'Diana Villanueva', 'diana@rabbitalley.local',    '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Diana',  300, 0, 1),
+(22, 'MDL005', 'Elena Cruz',       'elena@rabbitalley.local',    '$2b$10$B4oc/jK4Bx5OBvUzeDu7Berro8sqOpPnCKkigopy0Eg2FF3FGmKSG', 2, 1, 'Elena',  300, 0, 1)
 
 ON DUPLICATE KEY UPDATE
   name = VALUES(name),
@@ -1083,51 +1086,259 @@ ON DUPLICATE KEY UPDATE
   status = VALUES(status);
 
 -- ============================================================================
--- SEED DATA: Sample Discounts
+-- SEED DATA: Discounts
 -- ============================================================================
 
-INSERT INTO discounts (name, type, category, applicable_to, value, valid_from, valid_to, status, creator_id) VALUES
-('Senior Citizen', 'Standalone', 'Senior', 'Order', '20%', NULL, NULL, 'approved', 1),
-('PWD Discount', 'Standalone', 'PWD', 'Order', '20%', NULL, NULL, 'approved', 1),
-('Happy Hour', 'Applied', 'Happy Hour', 'Product', '₱50.00', NULL, NULL, 'approved', 1),
-('VIP Member', 'Standalone', 'VIP', 'Order', '15%', NULL, NULL, 'approved', 1),
-('Summer Promo', 'Applied', 'Seasonal', 'Category', '10%', '2024-03-01', '2024-05-31', 'pending', 1)
-ON DUPLICATE KEY UPDATE
-  name = VALUES(name),
-  type = VALUES(type),
-  category = VALUES(category),
-  applicable_to = VALUES(applicable_to),
-  value = VALUES(value),
-  valid_from = VALUES(valid_from),
-  valid_to = VALUES(valid_to),
-  status = VALUES(status);
+INSERT INTO discounts (id, name, type, category, applicable_to, value, valid_from, valid_to, status, creator_id) VALUES
+(1, 'Senior Citizen', 'Standalone', 'Senior', 'Order', '20%', NULL, NULL, 'approved', 1),
+(2, 'PWD Discount', 'Standalone', 'PWD', 'Order', '20%', NULL, NULL, 'approved', 1),
+(3, 'Happy Hour', 'Applied', 'Happy Hour', 'Product', '₱50.00', NULL, NULL, 'approved', 1),
+(4, 'VIP Member', 'Standalone', 'VIP', 'Order', '15%', NULL, NULL, 'approved', 1),
+(5, 'Summer Promo', 'Applied', 'Seasonal', 'Category', '10%', '2026-03-01', '2026-12-31', 'approved', 1),
+(6, 'Staff Discount', 'Standalone', 'Staff', 'Order', '20%', NULL, NULL, 'approved', 1)
+ON DUPLICATE KEY UPDATE name = VALUES(name), value = VALUES(value), status = VALUES(status);
 
 -- ============================================================================
--- SEED DATA: Sample Orders (for testing reports) - Branch 1
+-- SEED DATA: Waiter Table Assignments
 -- ============================================================================
 
-INSERT INTO orders (branch_id, table_id, status, subtotal, discount, tax, total, employee_id, order_date) VALUES
-(1, 'L1', 'paid', 500.00, 0.00, 60.00, 560.00, 'WTR001', CURDATE()),
-(1, 'C3', 'paid', 800.00, 50.00, 90.00, 840.00, 'WTS001', CURDATE()),
-(1, 'LD2', 'pending', 1200.00, 0.00, 144.00, 1344.00, 'WTR002', CURDATE())
-ON DUPLICATE KEY UPDATE
-  status = VALUES(status),
-  subtotal = VALUES(subtotal),
-  discount = VALUES(discount),
-  tax = VALUES(tax),
-  total = VALUES(total);
+INSERT IGNORE INTO waiter_table_assignments (branch_id, user_id, table_id) VALUES
+(1, 8, 'L1'), (1, 8, 'L2'), (1, 8, 'L3'),
+(1, 9, 'L4'), (1, 9, 'L5'), (1, 9, 'L6'),
+(1, 10, 'C1'), (1, 10, 'C2'), (1, 10, 'C3'), (1, 10, 'C4'),
+(1, 11, 'C5'), (1, 11, 'C6'), (1, 11, 'C7'), (1, 11, 'C8'),
+(1, 12, 'LD1'), (1, 12, 'LD2'), (1, 13, 'LD3'), (1, 13, 'LD4');
+
+-- ============================================================================
+-- SEED DATA: Printers & Hardware Configuration
+-- ============================================================================
+
+INSERT INTO printers (id, name, interface, type, branch_id, active) VALUES
+(1, 'Counter Cashier Printer', 'tcp://192.168.1.100:9100', 'epson', 1, 1),
+(2, 'Kitchen Order Chit Printer', 'tcp://192.168.1.101:9100', 'epson', 1, 1),
+(3, 'Bar Beverage Chit Printer', 'tcp://192.168.1.102:9100', 'epson', 1, 1)
+ON DUPLICATE KEY UPDATE name = VALUES(name), interface = VALUES(interface), active = VALUES(active);
+
+-- ============================================================================
+-- SEED DATA: Product Stock & Area Pricing
+-- ============================================================================
+-- Give all products an initial inventory stock count of 150 units on hand
+INSERT IGNORE INTO product_stock (product_id, qty_on_hand)
+SELECT id, 150.000 FROM products;
+
+-- Set up area pricing (Lounge / Club / LD) for select products
+INSERT IGNORE INTO product_area_prices (product_id, area, price)
+SELECT id, 'Lounge', price FROM products WHERE category IN ('Hard Liquor', 'Beers', 'Wines');
+
+INSERT IGNORE INTO product_area_prices (product_id, area, price)
+SELECT id, 'Club', ROUND(price * 1.10, 2) FROM products WHERE category IN ('Hard Liquor', 'Beers', 'Wines');
+
+INSERT IGNORE INTO product_area_prices (product_id, area, price)
+SELECT id, 'LD', price FROM products WHERE department = 'LD';
+
+-- ============================================================================
+-- SEED DATA: Order Number Sequences & Table Sessions
+-- ============================================================================
+INSERT INTO order_number_sequences (branch_id, seq_date, last_seq) VALUES
+(1, CURDATE(), 15)
+ON DUPLICATE KEY UPDATE last_seq = 15;
+
+INSERT INTO table_sessions (id, branch_id, table_id, waiter_id, opened_at, closed_at, status, closed_by) VALUES
+(1, 1, 'L1', 'WTR001', DATE_SUB(NOW(), INTERVAL 3 HOUR), DATE_SUB(NOW(), INTERVAL 1 HOUR), 'closed', 'Toyskie'),
+(2, 1, 'C3', 'WTS001', DATE_SUB(NOW(), INTERVAL 4 HOUR), DATE_SUB(NOW(), INTERVAL 2 HOUR), 'closed', 'Toyskie'),
+(3, 1, 'LD2', 'WTR002', DATE_SUB(NOW(), INTERVAL 2 HOUR), DATE_SUB(NOW(), INTERVAL 30 MINUTE), 'closed', 'Toyskie'),
+(4, 1, 'L2', 'WTR001', DATE_SUB(NOW(), INTERVAL 45 MINUTE), NULL, 'open', NULL),
+(5, 1, 'C1', 'WTR003', DATE_SUB(NOW(), INTERVAL 30 MINUTE), NULL, 'open', NULL),
+(6, 1, 'C2', 'WTR003', DATE_SUB(NOW(), INTERVAL 20 MINUTE), NULL, 'open', NULL),
+(7, 1, 'LD1', 'WTS001', DATE_SUB(NOW(), INTERVAL 15 MINUTE), NULL, 'open', NULL),
+(8, 1, 'L4', 'WTR002', DATE_SUB(NOW(), INTERVAL 50 MINUTE), DATE_SUB(NOW(), INTERVAL 40 MINUTE), 'closed', 'Angelo Val Morante')
+ON DUPLICATE KEY UPDATE status = VALUES(status), closed_at = VALUES(closed_at);
+
+-- Ensure status column supports voided and cancelled values if table already existed
+ALTER TABLE orders MODIFY COLUMN status ENUM('pending','paid','voided','cancelled') NOT NULL DEFAULT 'pending';
+
+-- ============================================================================
+-- SEED DATA: Orders (Paid, Pending & Voided)
+-- ============================================================================
+INSERT INTO orders (id, branch_id, order_number, table_id, session_id, status, payment_method, subtotal, discount, tax, total, employee_id, order_date, voided_at, voided_by, voided_by_name) VALUES
+(1, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0001'), 'L1', 1, 'paid', 'cash', 1339.29, 0.00, 160.71, 1500.00, 'WTR001', CURDATE(), NULL, NULL, NULL),
+(2, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0002'), 'C3', 2, 'paid', 'gcash', 2857.14, 0.00, 342.86, 3200.00, 'WTS001', CURDATE(), NULL, NULL, NULL),
+(3, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0003'), 'LD2', 3, 'paid', 'debit', 4017.86, 0.00, 482.14, 4500.00, 'WTR002', CURDATE(), NULL, NULL, NULL),
+(4, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0004'), 'L2', 4, 'pending', NULL, 1650.00, 0.00, 198.00, 1848.00, 'WTR001', CURDATE(), NULL, NULL, NULL),
+(5, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0005'), 'C1', 5, 'pending', NULL, 1964.29, 0.00, 235.71, 2200.00, 'WTR003', CURDATE(), NULL, NULL, NULL),
+(6, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0006'), 'C2', 6, 'pending', NULL, 848.21, 0.00, 101.79, 950.00, 'WTR003', CURDATE(), NULL, NULL, NULL),
+(7, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0007'), 'LD1', 7, 'pending', NULL, 1250.00, 0.00, 150.00, 1400.00, 'WTS001', CURDATE(), NULL, NULL, NULL),
+(8, 1, CONCAT(DATE_FORMAT(CURDATE(), '%Y%m%d'), '-0008'), 'L4', 8, 'voided', NULL, 0.00, 0.00, 0.00, 0.00, 'WTR002', CURDATE(), NOW(), 1, 'Angelo Val Morante')
+ON DUPLICATE KEY UPDATE status = VALUES(status), total = VALUES(total), voided_at = VALUES(voided_at);
+
+-- Mark active tables as occupied
+UPDATE pos_tables SET status = 'occupied', current_order_id = '4' WHERE id = 'L2' AND branch_id = 1;
+UPDATE pos_tables SET status = 'occupied', current_order_id = '5' WHERE id = 'C1' AND branch_id = 1;
+UPDATE pos_tables SET status = 'occupied', current_order_id = '6' WHERE id = 'C2' AND branch_id = 1;
+UPDATE pos_tables SET status = 'occupied', current_order_id = '7' WHERE id = 'LD1' AND branch_id = 1;
+
+-- ============================================================================
+-- SEED DATA: Order Items (Food, Drinks, Ladies Drinks, Complimentary & Voided)
+-- ============================================================================
+INSERT INTO order_items (id, order_id, product_sku, product_name, quantity, unit_price, discount, subtotal, department, sent_to_dept, is_complimentary, served_by, special_request, is_voided, voided_by, voided_at, voided_by_name) VALUES
+-- Order 1 (L1 - Paid)
+(1, 1, 'PASTA-001', 'Porcini and Truffle Pasta (Regular)', 1, 448.00, 0.00, 448.00, 'Kitchen', 1, 0, NULL, 'Extra cheese', 0, NULL, NULL, NULL),
+(2, 1, 'SEA-005', 'Garlic Butter Shrimp', 1, 368.00, 0.00, 368.00, 'Kitchen', 1, 0, NULL, NULL, 0, NULL, NULL, NULL),
+(3, 1, 'BEER-006', 'SML/SMB/SMA Bucket', 1, 598.00, 0.00, 598.00, 'Bar', 1, 0, NULL, 'Ice cold', 0, NULL, NULL, NULL),
+(4, 1, 'NA-001', 'Bottled Water', 2, 75.00, 0.00, 150.00, 'Bar', 1, 1, NULL, 'Complimentary house water', 0, NULL, NULL, NULL),
+
+-- Order 2 (C3 - Paid)
+(5, 2, 'LIQ-010', 'JW Black Label', 1, 3200.00, 0.00, 3200.00, 'Bar', 1, 0, NULL, 'With bucket of ice & soda water', 0, NULL, NULL, NULL),
+(6, 2, 'PORK-002', 'Sizzling Pork Sisig', 1, 268.00, 0.00, 268.00, 'Kitchen', 1, 0, NULL, 'No raw egg', 0, NULL, NULL, NULL),
+(7, 2, 'PORK-004', 'Crispy Pata Platter', 1, 1088.00, 0.00, 1088.00, 'Kitchen', 1, 0, NULL, 'Chopped', 0, NULL, NULL, NULL),
+-- Voided item inside paid order 2
+(8, 2, 'SEA-002', 'Fish and Chips', 1, 328.00, 0.00, 328.00, 'Kitchen', 1, 0, NULL, 'Customer cancelled due to wait time', 1, 1, DATE_SUB(NOW(), INTERVAL 3 HOUR), 'Angelo Val Morante'),
+
+-- Order 3 (LD2 - Paid with Ladies Drinks)
+(9, 3, 'LIQ-008', 'Jose Cuervo', 1, 2200.00, 0.00, 2200.00, 'Bar', 1, 0, NULL, 'With orange slice and cinnamon', 0, NULL, NULL, NULL),
+(10, 3, 'LD-008', 'Vodka Soda', 2, 400.00, 0.00, 800.00, 'LD', 1, 0, 18, 'For Angel (MDL001)', 0, NULL, NULL, NULL),
+(11, 3, 'LD-010', 'Margarita', 3, 500.00, 0.00, 1500.00, 'LD', 1, 0, 19, 'For Bianca (MDL002)', 0, NULL, NULL, NULL),
+
+-- Order 4 (L2 - Active Pending)
+(12, 4, 'BEEF-001', 'Grilled Wagyu Cubes', 2, 438.00, 0.00, 876.00, 'Kitchen', 1, 0, NULL, 'Medium well', 0, NULL, NULL, NULL),
+(13, 4, 'BEER-007', 'RH/Mule Bucket', 1, 720.00, 0.00, 720.00, 'Bar', 1, 0, NULL, 'Smirnoff Mule bucket', 0, NULL, NULL, NULL),
+(14, 4, 'NA-003', 'Soda (Carafe)', 1, 250.00, 0.00, 250.00, 'Bar', 1, 0, NULL, 'Coke', 0, NULL, NULL, NULL),
+
+-- Order 5 (C1 - Active Pending)
+(15, 5, 'LIQ-001', 'Soju', 4, 500.00, 0.00, 2000.00, 'Bar', 1, 0, NULL, 'Chamisul Fresh', 0, NULL, NULL, NULL),
+(16, 5, 'PORK-002', 'Sizzling Pork Sisig', 2, 268.00, 0.00, 536.00, 'Kitchen', 1, 0, NULL, 'Extra chili', 0, NULL, NULL, NULL),
+-- Pending voided item in Order 5
+(17, 5, 'SOUP-001', 'Sinigang na Kambing', 1, 558.00, 0.00, 558.00, 'Kitchen', 1, 0, NULL, 'Out of stock', 1, 2, DATE_SUB(NOW(), INTERVAL 15 MINUTE), 'Jedd Kris Paul Patio'),
+
+-- Order 6 (C2 - Active Pending)
+(18, 6, 'CHKN-009', 'Fried Chicken Wings (Half)', 1, 398.00, 0.00, 398.00, 'Kitchen', 1, 0, NULL, 'Buffalo flavor', 0, NULL, NULL, NULL),
+(19, 6, 'BEER-001', 'San Miguel Light', 3, 150.00, 0.00, 450.00, 'Bar', 1, 0, NULL, NULL, 0, NULL, NULL, NULL),
+
+-- Order 7 (LD1 - Active Pending with Ladies Drinks)
+(20, 7, 'WINE-001', 'Yellow Tail Pink Moscato', 1, 2000.00, 0.00, 2000.00, 'Bar', 1, 0, NULL, 'Chilled with wine bucket', 0, NULL, NULL, NULL),
+(21, 7, 'LD-011', 'Mojito', 1, 500.00, 0.00, 500.00, 'LD', 1, 0, 20, 'For Clarisse (MDL003)', 0, NULL, NULL, NULL),
+(22, 7, 'LD-013', 'Sex on the Beach', 1, 550.00, 0.00, 550.00, 'LD', 1, 0, 21, 'For Diana (MDL004)', 0, NULL, NULL, NULL),
+
+-- Order 8 (L4 - Full Voided Order)
+(23, 8, 'GRP-001', 'RabbitAlley Sampler', 1, 4000.00, 0.00, 4000.00, 'Kitchen', 1, 0, NULL, 'Guest walked out before cooking started', 1, 1, DATE_SUB(NOW(), INTERVAL 40 MINUTE), 'Angelo Val Morante'),
+(24, 8, 'LIQ-011', 'Jack Daniels Whiskey', 1, 3700.00, 0.00, 3700.00, 'Bar', 1, 0, NULL, 'Guest walked out before cooking started', 1, 1, DATE_SUB(NOW(), INTERVAL 40 MINUTE), 'Angelo Val Morante')
+ON DUPLICATE KEY UPDATE product_name = VALUES(product_name), subtotal = VALUES(subtotal), is_voided = VALUES(is_voided);
+
+-- Link order items to product IDs via SKU
+UPDATE order_items oi JOIN products p ON p.sku = oi.product_sku SET oi.product_id = p.id WHERE oi.product_id IS NULL;
+
+-- ============================================================================
+-- SEED DATA: Void & Audit Log Records (Ensures Reports -> Voids is populated!)
+-- ============================================================================
+INSERT INTO void_log (branch_id, void_type, order_id, order_item_id, product_id, product_sku, product_name, quantity, unit_price, amount, table_id, session_id, voided_by, voided_by_name, voided_by_employee_id, voided_at, reason) VALUES
+(1, 'item', 2, 8, NULL, 'SEA-002', 'Fish and Chips', 1, 328.00, 328.00, 'C3', 2, 1, 'Angelo Val Morante', 'MGR001', DATE_SUB(NOW(), INTERVAL 3 HOUR), 'Customer cancelled due to wait time'),
+(1, 'item', 5, 17, NULL, 'SOUP-001', 'Sinigang na Kambing', 1, 558.00, 558.00, 'C1', 5, 2, 'Jedd Kris Paul Patio', 'MGR002', DATE_SUB(NOW(), INTERVAL 15 MINUTE), 'Kitchen out of goat meat'),
+(1, 'order', 8, 23, NULL, 'GRP-001', 'RabbitAlley Sampler', 1, 4000.00, 4000.00, 'L4', 8, 1, 'Angelo Val Morante', 'MGR001', DATE_SUB(NOW(), INTERVAL 40 MINUTE), 'CANCEL - Guest emergency leave before serving'),
+(1, 'order', 8, 24, NULL, 'LIQ-011', 'Jack Daniels Whiskey', 1, 3700.00, 3700.00, 'L4', 8, 1, 'Angelo Val Morante', 'MGR001', DATE_SUB(NOW(), INTERVAL 40 MINUTE), 'CANCEL - Guest emergency leave before serving'),
+(1, 'item', 1, NULL, NULL, 'BEER-004', 'Red Horse Stallion', 2, 200.00, 400.00, 'L1', 1, 1, 'Angelo Val Morante', 'MGR001', DATE_SUB(NOW(), INTERVAL 5 HOUR), 'Changed order to San Mig Bucket'),
+(1, 'item', 3, NULL, NULL, 'LD-001', 'San Mig Light (LD)', 1, 350.00, 350.00, 'LD2', 3, 5, 'Len Gabriel Liwanag (GL)', 'GL', DATE_SUB(NOW(), INTERVAL 2 HOUR), 'Mistakenly added duplicate LD item');
+
+UPDATE void_log vl JOIN products p ON p.sku = vl.product_sku SET vl.product_id = p.id WHERE vl.product_id IS NULL;
+
+-- ============================================================================
+-- SEED DATA: Payroll Payouts & Commission Summaries
+-- ============================================================================
+INSERT INTO payouts (user_id, period_from, period_to, allowance, hours, commission, incentives, adjustments, deductions, total, status, approved_by) VALUES
+(18, DATE_SUB(CURDATE(), INTERVAL 7 DAY), CURDATE(), 2100.00, 40.00, 1850.00, 500.00, 0.00, 200.00, 4250.00, 'approved', 1),
+(19, DATE_SUB(CURDATE(), INTERVAL 7 DAY), CURDATE(), 2100.00, 42.00, 2400.00, 300.00, 0.00, 100.00, 4700.00, 'approved', 1),
+(8, DATE_SUB(CURDATE(), INTERVAL 7 DAY), CURDATE(), 2450.00, 48.00, 850.00, 400.00, 0.00, 150.00, 5950.00, 'approved', 1),
+(9, DATE_SUB(CURDATE(), INTERVAL 7 DAY), CURDATE(), 2450.00, 46.00, 720.00, 200.00, 0.00, 150.00, 5520.00, 'draft', NULL);
+
+-- ============================================================================
+-- SEED DATA: Shifts & Cash Counts
+-- ============================================================================
+INSERT INTO shifts (id, user_id, branch_id, shift_date, start_time, end_time, status, opening_cash, total_cash_sales, total_card_sales, total_gcash_sales, total_bank_sales, total_refunds, total_voids, expected_cash, actual_cash, cash_variance, variance_reason, approved_by, approved_at, notes) VALUES
+(1, 16, 1, DATE_SUB(CURDATE(), INTERVAL 1 DAY), DATE_SUB(NOW(), INTERVAL 28 HOUR), DATE_SUB(NOW(), INTERVAL 19 HOUR), 'approved', 5000.00, 24500.00, 18200.00, 15400.00, 8500.00, 500.00, 850.00, 29000.00, 29000.00, 0.00, 'Balanced register', 1, DATE_SUB(NOW(), INTERVAL 19 HOUR), 'Shift closed without issues'),
+(2, 17, 1, CURDATE(), DATE_SUB(NOW(), INTERVAL 6 HOUR), NULL, 'open', 5000.00, 13500.00, 8200.00, 9400.00, 4200.00, 0.00, 328.00, 18500.00, NULL, NULL, NULL, NULL, NULL, 'Currently active evening shift')
+ON DUPLICATE KEY UPDATE status = VALUES(status), total_cash_sales = VALUES(total_cash_sales);
+
+INSERT INTO cash_counts (shift_id, denomination, quantity, subtotal) VALUES
+(1, '1000', 20, 20000.00),
+(1, '500', 14, 7000.00),
+(1, '100', 15, 1500.00),
+(1, '50', 10, 500.00)
+ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), subtotal = VALUES(subtotal);
+
+-- ============================================================================
+-- SEED DATA: Refunds & Payment Voids
+-- ============================================================================
+INSERT INTO refunds (order_id, original_payment_method, refund_amount, refund_method, reason, status, requested_by, approved_by, shift_id, completed_at) VALUES
+(1, 'cash', 200.00, 'cash', 'Customer returned corked bottle of wine', 'completed', 16, 1, 1, DATE_SUB(NOW(), INTERVAL 4 HOUR));
+
+INSERT INTO payment_voids (order_id, payment_method, voided_amount, reason, status, requested_by, approved_by, shift_id, completed_at) VALUES
+(2, 'gcash', 500.00, 'Accidental double payment via QR scanner', 'completed', 17, 1, 2, DATE_SUB(NOW(), INTERVAL 2 HOUR));
+
+-- ============================================================================
+-- SEED DATA: Split Payments & Digital-to-Cash Conversions
+-- ============================================================================
+INSERT INTO split_payments (order_id, split_number, amount, payment_method, status, paid_at, processed_by) VALUES
+(3, 1, 2250.00, 'debit', 'paid', DATE_SUB(NOW(), INTERVAL 1 HOUR), 16),
+(3, 2, 2250.00, 'gcash', 'paid', DATE_SUB(NOW(), INTERVAL 1 HOUR), 16);
+
+INSERT INTO payment_conversions (branch_id, shift_id, from_method, to_method, amount, notes, converted_by) VALUES
+(1, 1, 'gcash', 'cash', 5000.00, 'GCash cashed out for weekly kitchen petty cash & pasahod', 'Toyskie'),
+(1, 2, 'bank', 'cash', 8000.00, 'BPI Online transfer converted to cash for beverage supplier payment', 'Romgel');
+
+-- ============================================================================
+-- SEED DATA: Charge (Utang/Credit) & Table Transfers
+-- ============================================================================
+INSERT INTO charge_transactions (branch_id, order_ids, customer_name, amount, status, charged_by, paid_by, notes) VALUES
+(1, '1', 'Boss Martin (Owner Guest Account)', 3500.00, 'pending', 'Toyskie', NULL, 'VIP Guest table hosting'),
+(1, '2', 'Senator Marco (Regina Group)', 8400.00, 'paid', 'Romgel', 'Angelo Val Morante', 'Settled via direct corporate bank check');
+
+INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason) VALUES
+(4, 'L5', 'L2', 'move', 8, 'Guests wanted a table closer to the live band stage'),
+(5, 'C8', 'C1', 'move', 10, 'VIP group requested bigger booth corner');
+
+-- ============================================================================
+-- SEED DATA: Attendance & Audit Logs
+-- ============================================================================
+INSERT INTO attendance (user_id, work_date, time_in, time_out, break_minutes, notes) VALUES
+(8, CURDATE(), DATE_SUB(NOW(), INTERVAL 6 HOUR), NULL, 30, 'On time'),
+(9, CURDATE(), DATE_SUB(NOW(), INTERVAL 6 HOUR), NULL, 30, 'On time'),
+(16, CURDATE(), DATE_SUB(NOW(), INTERVAL 7 HOUR), NULL, 45, 'Cashier Opening Shift'),
+(18, CURDATE(), DATE_SUB(NOW(), INTERVAL 5 HOUR), NULL, 15, 'Model shift active')
+ON DUPLICATE KEY UPDATE time_in = VALUES(time_in);
+
+INSERT INTO audit_logs (user_id, employee_id, user_name, role_name, action, entity_type, entity_id, details, ip_address, branch_id) VALUES
+(1, 'MGR001', 'Angelo Val Morante', 'Administrator', 'LOGIN', 'user', '1', '{"status":"success"}', '127.0.0.1', 1),
+(16, 'BAR001', 'Toyskie', 'Operations Staff', 'OPEN_SHIFT', 'shift', '2', '{"opening_cash":5000}', '127.0.0.1', 1),
+(8, 'WTR001', 'Christian', 'Staff', 'CREATE_ORDER', 'order', '4', '{"table_id":"L2","items":3}', '192.168.1.50', 1),
+(5, 'GL', 'Len Gabriel Liwanag (GL)', 'Administrator', 'APPROVE_VOID', 'order_item', '6', '{"reason":"Mistakenly added duplicate LD item"}', '192.168.1.10', 1);
+
+-- ============================================================================
+-- SEED DATA: Receipt Snapshots & Migrations Tracking
+-- ============================================================================
+INSERT INTO receipt_snapshots (branch_id, snapshot_type, order_id, table_id, session_id, payment_method, receipt_json, created_by) VALUES
+(1, 'official_receipt', 1, 'L1', 1, 'cash', '{"orderNumber":"20260731-0001","tableId":"L1","subtotal":1339.29,"tax":160.71,"total":1500.00,"cashier":"Toyskie","items":[{"name":"Porcini and Truffle Pasta","qty":1,"price":448.00},{"name":"Garlic Butter Shrimp","qty":1,"price":368.00},{"name":"SML/SMB/SMA Bucket","qty":1,"price":598.00}]}', 16),
+(1, 'running_bill', 4, 'L2', 4, NULL, '{"orderNumber":"20260731-0004","tableId":"L2","subtotal":1650.00,"tax":198.00,"total":1848.00,"waiter":"Christian","items":[{"name":"Grilled Wagyu Cubes","qty":2,"price":876.00},{"name":"RH/Mule Bucket","qty":1,"price":720.00},{"name":"Soda (Carafe)","qty":1,"price":250.00}]}', 8);
+
+INSERT IGNORE INTO schema_migrations (migration_name) VALUES
+('initial_schema'),
+('add_sub_category_to_products'),
+('order_void_and_per_item_void'),
+('table_sessions_migration'),
+('comprehensive_seed_data_v1');
 
 -- ============================================================================
 -- SETUP COMPLETE! - Rabbit Alley Garden Bar & Bistro POS
 -- ============================================================================
 -- 
--- Staff Accounts (all passwords: "password"):
+-- Staff Accounts (all default passwords: "password"):
 --
--- MANAGERS:
+-- MANAGERS / ADMIN (Can Authorize Voids, Discounts & Reports):
 --   MGR001 (Gelo)  - Angelo Val Morante - General Manager
 --   MGR002 (Jedd)  - Jedd Kris Paul Patio - Officer in Charge
 --   MGR003 (Gab)   - Len Gabriel Liwanag - Manager
 --   MGR004 (Monk)  - Martin Tolentino - Owner
+--   GL             - Len Gabriel Liwanag (GL Shortcut)
+--   ADMIN          - System Administrator
+--   MGR            - Default Manager Account
 --
 -- WAITERS:
 --   WTR001 - Christian
@@ -1141,7 +1352,7 @@ ON DUPLICATE KEY UPDATE
 --   WTS003 - Kath
 --   WTS004 - Joy
 --
--- BARTENDERS:
+-- BARTENDERS / CASHIERS:
 --   BAR001 - Toyskie
 --   BAR002 - Romgel
 --
@@ -1151,11 +1362,5 @@ ON DUPLICATE KEY UPDATE
 --   MDL003 - Clarisse Dela Cruz (Cla)
 --   MDL004 - Diana Villanueva (Diana)
 --   MDL005 - Elena Cruz       (Elena)
---
--- To start:
---   1. Run this SQL script in HeidiSQL
---   2. Start API server: cd server && npm run dev
---   3. Start frontend: npm run dev
---   4. Login with any employee ID above + password "password"
---
 -- ============================================================================
+

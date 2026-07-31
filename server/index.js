@@ -2290,7 +2290,8 @@ async function verifyManagerForVoid(db, employeeId, password) {
     [user.role_id]
   );
   const permissions = permRows.map((r) => r.name);
-  if (!permissions.includes("approve_discounts")) throw new Error("Only a Manager can authorize void");
+  const canVoid = permissions.includes("approve_voids") || permissions.includes("approve_discounts") || permissions.includes("manage_pos") || user.role_id === 1;
+  if (!canVoid) throw new Error("Only a Manager can authorize void");
   return { id: user.id, name: user.name };
 }
 
@@ -2345,11 +2346,11 @@ app.post("/api/orders/:id/void", requireAnyPermission("request_voids", "approve_
     }
     res.json({ ok: true, voidedByName: manager.name });
   } catch (err) {
-    if (err.message && (err.message.includes("Employee ID") || err.message.includes("Password") || err.message.includes("Manager"))) {
+    if (err.message && (err.message.includes("Employee ID") || err.message.includes("Password") || err.message.includes("Manager") || err.message.includes("required"))) {
       return res.status(401).json({ error: err.message });
     }
     console.error("Order void error:", err);
-    res.status(500).json({ error: "Failed to void order" });
+    res.status(500).json({ error: err.message || "Failed to void order" });
   }
 });
 
@@ -2423,11 +2424,11 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
     }
     res.json({ ok: true, voidedByName: manager.name });
   } catch (err) {
-    if (err.message && (err.message.includes("Employee ID") || err.message.includes("Password") || err.message.includes("Manager"))) {
+    if (err.message && (err.message.includes("Employee ID") || err.message.includes("Password") || err.message.includes("Manager") || err.message.includes("required"))) {
       return res.status(401).json({ error: err.message });
     }
     console.error("Item void error:", err);
-    res.status(500).json({ error: "Failed to void item" });
+    res.status(500).json({ error: err.message || "Failed to void item" });
   }
 });
 
