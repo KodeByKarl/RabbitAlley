@@ -36,6 +36,7 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { formatCurrency } from "@/lib/utils";
+import { formatOrderListLabel } from "@/lib/formatOrderNumber";
 import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
 import * as XLSX from "xlsx";
@@ -979,54 +980,107 @@ export default function Reports() {
     }
   }, [orderIdFromCode]);
 
-  const printFinalBillReceipts = useCallback(
-    (
-      entries: Array<{
-        orderId: string;
+  type FinalBillReceiptEntry = {
+    orderId: string;
+    receipt: {
+      orderNumber?: string;
+      date?: string;
+      time?: string;
+      table?: string;
+      cashier?: string;
+      businessName?: string;
+      businessAddress?: string;
+      businessContact?: string;
+      receiptFooter?: string;
+      vatTin?: string;
+      serviceLabel?: string;
+      taxLabel?: string;
+      items?: Array<{ name: string; quantity: number; subtotal: number; note?: string; isComplimentary?: boolean }>;
+      subtotal?: number;
+      complimentary?: number;
+      discount?: number;
+      serviceCharge?: number;
+      tax?: number;
+      cardSurcharge?: number;
+      total?: number;
+      paymentMethod?: string;
+      originalPaymentMethod?: string | null;
+      amountPaid?: number;
+      change?: number;
+      isReprint?: boolean;
+    };
+  };
+
+  /** Merge per-order snapshots into one table bill — same behavior as POS final-bill reprint. */
+  const mergeFinalBillReceipts = useCallback((entries: FinalBillReceiptEntry[]): FinalBillReceiptEntry[] => {
+    if (entries.length <= 1) return entries;
+    const mergedOrderNumbers = entries
+      .map((entry) => String(entry.receipt?.orderNumber ?? entry.orderId))
+      .filter(Boolean);
+    const mergedItems = entries.flatMap((entry) =>
+      Array.isArray(entry.receipt?.items) ? entry.receipt.items : []
+    );
+    const mergedSubtotal = entries.reduce((sum, entry) => sum + Number(entry.receipt?.subtotal ?? 0), 0);
+    const mergedComplimentary = entries.reduce((sum, entry) => sum + Number(entry.receipt?.complimentary ?? 0), 0);
+    const mergedDiscount = entries.reduce((sum, entry) => sum + Number(entry.receipt?.discount ?? 0), 0);
+    const mergedServiceCharge = entries.reduce((sum, entry) => sum + Number(entry.receipt?.serviceCharge ?? 0), 0);
+    const mergedTax = entries.reduce((sum, entry) => sum + Number(entry.receipt?.tax ?? 0), 0);
+    const mergedCardFee = entries.reduce((sum, entry) => sum + Number(entry.receipt?.cardSurcharge ?? 0), 0);
+    const mergedTotal = entries.reduce((sum, entry) => sum + Number(entry.receipt?.total ?? 0), 0);
+    const mergedChange = entries.reduce((sum, entry) => sum + Number(entry.receipt?.change ?? 0), 0);
+    const mergedAmountPaid = mergedTotal + mergedChange;
+    const mergedPaymentMethods = Array.from(
+      new Set(
+        entries
+          .map((entry) =>
+            String(entry.receipt?.originalPaymentMethod ?? entry.receipt?.paymentMethod ?? "").trim()
+          )
+          .filter((m) => m && !/^reprint$/i.test(m))
+      )
+    );
+    const baseReceipt = entries[0]?.receipt ?? {};
+    return [
+      {
+        orderId: entries[0].orderId,
         receipt: {
-          orderNumber?: string;
-          date?: string;
-          time?: string;
-          table?: string;
-          cashier?: string;
-          businessName?: string;
-          businessAddress?: string;
-          businessContact?: string;
-          receiptFooter?: string;
-          vatTin?: string;
-          serviceLabel?: string;
-          taxLabel?: string;
-          items?: Array<{ name: string; quantity: number; subtotal: number }>;
-          subtotal?: number;
-          complimentary?: number;
-          discount?: number;
-          serviceCharge?: number;
-          tax?: number;
-          cardSurcharge?: number;
-          total?: number;
-          paymentMethod?: string;
-          originalPaymentMethod?: string | null;
-          amountPaid?: number;
-          change?: number;
-          isReprint?: boolean;
-        };
-      }>
-    ) => {
-    if (!entries.length) return;
+          ...baseReceipt,
+          orderNumber: formatOrderListLabel(mergedOrderNumbers),
+          items: mergedItems,
+          subtotal: mergedSubtotal,
+          complimentary: mergedComplimentary > 0 ? mergedComplimentary : undefined,
+          discount: mergedDiscount > 0 ? mergedDiscount : undefined,
+          serviceCharge: mergedServiceCharge,
+          tax: mergedTax,
+          cardSurcharge: mergedCardFee > 0 ? mergedCardFee : undefined,
+          total: mergedTotal,
+          amountPaid: mergedAmountPaid,
+          change: mergedChange,
+          paymentMethod: mergedPaymentMethods.length === 1 ? mergedPaymentMethods[0] : "Mixed",
+          originalPaymentMethod: mergedPaymentMethods.length === 1 ? mergedPaymentMethods[0] : "Mixed",
+        },
+      },
+    ];
+  }, []);
+
+  const printFinalBillReceipts = useCallback((entries: FinalBillReceiptEntry[]) => {
+    const toPrint = mergeFinalBillReceipts(entries);
+    if (!toPrint.length) return;
     const w = window.open("", "_blank", "width=420,height=980,scrollbars=yes");
     if (!w) return;
-    const sections = entries.map(({ receipt, orderId }) => {
-      const payRaw = receipt.originalPaymentMethod || receipt.paymentMethod || "";
-      const payLabel = payRaw && !/^reprint$/i.test(payRaw) ? String(payRaw).toUpperCase() : "—";
-      const rows = (receipt.items || [])
-        .map((item) => `
+    const { receipt, orderId } = toPrint[0];
+    const payRaw = receipt.originalPaymentMethod || receipt.paymentMethod || "";
+    const payLabel = payRaw && !/^reprint$/i.test(payRaw) ? String(payRaw).toUpperCase() : "—";
+    const rows = (receipt.items || [])
+      .map(
+        (item) => `
           <tr>
             <td>${escapeHtml(item.quantity)}x ${escapeHtml(item.name)}</td>
             <td class="num">₱${Number(item.subtotal || 0).toFixed(2)}</td>
           </tr>
-        `)
-        .join("");
-      return `
+        `
+      )
+      .join("");
+    const section = `
         <section class="receipt">
           <div class="center bold">${escapeHtml(receipt.businessName || "RABBIT ALLEY")}</div>
           ${receipt.businessAddress ? `<div class="center">${escapeHtml(receipt.businessAddress)}</div>` : ""}
@@ -1058,7 +1112,6 @@ export default function Reports() {
           <div class="center reprint footer">** REPRINT — NOT A DUPLICATE **</div>
         </section>
       `;
-    }).join("");
     w.document.write(`
       <!DOCTYPE html>
       <html>
@@ -1067,8 +1120,7 @@ export default function Reports() {
           <style>
             @page { size: 80mm auto; margin: 3mm 2mm 8mm 2mm; }
             body { margin: 0; padding: 0; font-family: 'Courier New', monospace; font-size: 11px; color: #000; background: #fff; }
-            .receipt { width: 76mm; margin: 0 auto 8mm; padding: 5px 3px; page-break-after: always; }
-            .receipt:last-child { page-break-after: auto; }
+            .receipt { width: 76mm; margin: 0 auto; padding: 5px 3px; }
             .center { text-align: center; }
             .bold { font-weight: 700; }
             .reprint { margin-top: 2px; font-weight: 700; }
@@ -1080,13 +1132,16 @@ export default function Reports() {
             .footer { margin-top: 6px; }
           </style>
         </head>
-        <body>${sections}</body>
+        <body>${section}</body>
       </html>
     `);
     w.document.close();
     w.focus();
-    setTimeout(() => { w.print(); w.close(); }, 250);
-  }, []);
+    setTimeout(() => {
+      w.print();
+      w.close();
+    }, 250);
+  }, [mergeFinalBillReceipts]);
 
   const handlePrintTransaction = useCallback(async (group: SalesGroupRow) => {
     if (!canReprintFinalBill) {
@@ -1098,11 +1153,19 @@ export default function Reports() {
       return;
     }
     try {
-      const orderIds = group.orders.map((order) => orderIdFromCode(order.id));
+      const orderIds = group.orders
+        .filter((order) => order.status === "paid")
+        .map((order) => orderIdFromCode(order.id));
+      if (!orderIds.length) {
+        toast.error("No paid orders found for this transaction");
+        return;
+      }
       const { receipts } = await api.orders.reprintFinalBills(orderIds, "sales_report");
       printFinalBillReceipts(receipts);
       toast.success(
-        `Final bill reprint: ${receipts.length} receipt${receipts.length > 1 ? "s" : ""}`
+        orderIds.length > 1
+          ? `Final bill reprint opened (1 receipt, ${orderIds.length} orders combined)`
+          : "Final bill reprint opened"
       );
       return;
     } catch (e) {

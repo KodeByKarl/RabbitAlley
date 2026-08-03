@@ -2359,6 +2359,7 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
   const itemId = req.params.id;
   const branchId = getBranchId(req);
   const { employeeId, password, reason } = req.body || {};
+  let conn;
   try {
     let reasonText;
     try {
@@ -2373,9 +2374,11 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
       [itemId, branchId]
     );
     if (!items.length) return res.status(404).json({ error: "Item not found" });
+    conn = await db.getConnection();
+    await conn.beginTransaction();
     try {
       try {
-        await logVoidsForOrderItems(db, {
+        await logVoidsForOrderItems(conn, {
           branchId,
           orderItemIds: [itemId],
           voidType: "item",
@@ -2387,24 +2390,24 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
         if (logErr.code !== "ER_NO_SUCH_TABLE") throw logErr;
       }
       // Pending item voids do not touch stock (stock only moves on payment).
-      await db.execute(
+      await conn.execute(
         "UPDATE order_items SET is_voided = 1, voided_by = ?, voided_at = NOW(), voided_by_name = ? WHERE id = ?",
         [manager.id, manager.name, itemId]
       );
       const orderId = items[0].order_id;
       const tableId = items[0].table_id;
-      const settings = await loadPosFinancialSettings(db);
-      await updateOrderTotalsFromItems(db, orderId, settings);
+      const settings = await loadPosFinancialSettings(conn);
+      await updateOrderTotalsFromItems(conn, orderId, settings);
 
       // If every item on this order is now voided, treat like a full order void so
       // vacateTableIfIdle can free the table (it only skips orders with voided_at set).
-      const [liveItems] = await db.execute(
+      const [liveItems] = await conn.execute(
         "SELECT id FROM order_items WHERE order_id = ? AND COALESCE(is_voided, 0) = 0 LIMIT 1",
         [orderId]
       );
       if (!liveItems.length) {
         try {
-          await db.execute(
+          await conn.execute(
             "UPDATE orders SET status = 'voided', voided_at = NOW(), voided_by = ?, voided_by_name = ?, subtotal = 0, discount = 0, tax = 0, total = 0 WHERE id = ? AND voided_at IS NULL",
             [manager.id, manager.name, orderId]
           );
@@ -2412,13 +2415,15 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
           if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
         }
         if (tableId) {
-          await reconcileTableVisitIds(db, branchId, tableId);
-          await vacateTableIfIdle(db, branchId, tableId, {
+          await reconcileTableVisitIds(conn, branchId, tableId);
+          await vacateTableIfIdle(conn, branchId, tableId, {
             closedBy: manager.name || "void",
           });
         }
       }
+      await conn.commit();
     } catch (e) {
+      await conn.rollback();
       if (e.code === "ER_BAD_FIELD_ERROR") return res.status(500).json({ error: "Void not supported: run schema migration for void columns" });
       throw e;
     }
@@ -2429,6 +2434,8 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
     }
     console.error("Item void error:", err);
     res.status(500).json({ error: err.message || "Failed to void item" });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
@@ -4394,27 +4401,49 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
       const displayTax = taxRatePct <= 0 ? 0 : rawTax;
       const splitCardAmount = Number(splitCardMap[String(r.id)] || 0);
       const splitPaidAmount = Number(splitPaidMap[String(r.id)] || 0);
-      const method = String(r.paymentMethod || "").toLowerCase();
+      const method = String(r.paymentMethod || "").toLowerCase().trim();
+      const orderStatus = String(r.status || "").toLowerCase();
       const orderTotal = Number(r.total || 0);
-      let estimatedCardSurcharge = 0;
-      if (method === "credit" || method === "debit") {
-        const divisor = 1 + cardSurchargeRate;
-        estimatedCardSurcharge = cardSurchargeRate > 0 ? round2(orderTotal - orderTotal / divisor) : 0;
-      } else if (method === "split_payment" && splitPaidAmount > 0 && cardSurchargeRate > 0) {
-        const cardRatio = Math.min(1, Math.max(0, splitCardAmount / splitPaidAmount));
-        const effectiveRate = cardSurchargeRate * cardRatio;
-        estimatedCardSurcharge = effectiveRate > 0 ? round2(orderTotal - orderTotal / (1 + effectiveRate)) : 0;
-      }
       const itemSubtotal = Number(nonVoidedSubtotalMap[String(r.id)] ?? r.subtotal ?? 0);
       const complimentary = Number(complimentaryMap[String(r.id)] || 0);
       const chargeableSubtotal = Math.max(0, itemSubtotal - complimentary);
       const taxableBase = Math.max(0, chargeableSubtotal - Number(r.discount || 0));
       const expectedService = computeServiceCharge(taxableBase);
-      if (estimatedCardSurcharge <= 0 && cardSurchargeRate > 0 && method !== "cash" && method !== "gcash" && method !== "bank" && method !== "charge" && method !== "split_payment") {
-        const inferred = round2(orderTotal - taxableBase - expectedService - rawTax);
-        estimatedCardSurcharge = Math.max(0, inferred);
+      // Expected bill without card fee (from live non-voided lines). Used to:
+      // 1) avoid treating void leftovers as "card surcharge"
+      // 2) correct stale pending totals after item void
+      const expectedBaseTotal = round2(taxableBase + expectedService + (taxRatePct <= 0 ? 0 : rawTax));
+      let estimatedCardSurcharge = 0;
+      if (isCardPaymentMethod(method) && orderStatus === "paid") {
+        // Residual = what was actually collected above the item/tax/service base.
+        const residual = round2(orderTotal - taxableBase - expectedService - rawTax);
+        if (residual > 0.005) {
+          estimatedCardSurcharge = residual;
+        } else if (cardSurchargeRate > 0 && orderTotal > 0) {
+          const divisor = 1 + cardSurchargeRate;
+          estimatedCardSurcharge = round2(orderTotal - orderTotal / divisor);
+        }
+      } else if (method === "split_payment" && orderStatus === "paid" && splitPaidAmount > 0 && cardSurchargeRate > 0) {
+        const cardRatio = Math.min(1, Math.max(0, splitCardAmount / splitPaidAmount));
+        const effectiveRate = cardSurchargeRate * cardRatio;
+        estimatedCardSurcharge = effectiveRate > 0 ? round2(orderTotal - orderTotal / (1 + effectiveRate)) : 0;
       }
-      const adjustedTotal = round2(orderTotal - (taxRatePct <= 0 ? rawTax : 0));
+      // Never infer card surcharge for cash/gcash/bank/charge/null/pending — a gap
+      // between orders.total and item subtotal is usually a void that failed to recalc.
+      const adjustedStoredTotal = round2(orderTotal - (taxRatePct <= 0 ? rawTax : 0));
+      let adjustedTotal;
+      if (orderStatus === "pending" || orderStatus === "voided") {
+        adjustedTotal = expectedBaseTotal;
+      } else if (
+        !isCardPaymentMethod(method) &&
+        method !== "split_payment" &&
+        adjustedStoredTotal > expectedBaseTotal + 0.05
+      ) {
+        // Paid cash/gcash/bank/charge with stale total (voided lines still in orders.total)
+        adjustedTotal = expectedBaseTotal;
+      } else {
+        adjustedTotal = adjustedStoredTotal;
+      }
       const timeMs = r.time ? new Date(r.time).getTime() : 0;
       const sessionIdNum = r.sessionId != null && Number(r.sessionId) > 0 ? Number(r.sessionId) : null;
       const visitAnchor = sessionIdNum != null
@@ -4475,12 +4504,13 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
             ? uniqEmp.join(", ")
             : `${uniqEmp[0]} · +${uniqEmp.length - 1}`;
       const activeOrders = ordList.filter((x) => x.status !== "voided");
+      const paidOrders = activeOrders.filter((x) => x.status === "paid");
       const allPaid = activeOrders.length === 0 || activeOrders.every((x) => x.status === "paid");
       const anyPending = activeOrders.some((x) => x.status === "pending");
       const isSessionClosed = head.sessionStatus === "closed" || (!anyPending && activeOrders.length > 0);
       const sessionStatus = head.sessionStatus || (isSessionClosed ? "closed" : "open");
-      // Session displays paid when all active orders are paid or session is closed.
-      const status = allPaid || head.sessionStatus === "closed" ? "paid" : "pending";
+      // Do not mark a session "paid" while it still has pending orders (even if session row is closed).
+      const status = anyPending ? "pending" : allPaid || head.sessionStatus === "closed" ? "paid" : "pending";
       const openedMs = head.sessionOpenedAt ? new Date(head.sessionOpenedAt).getTime() : Math.min(...ordList.map((x) => x.timeMs));
       const closedMs = head.sessionClosedAt
         ? new Date(head.sessionClosedAt).getTime()
@@ -4491,19 +4521,22 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
           : openedMs
             ? formatTime(openedMs)
             : head.time;
-      const paymentMethods = [...new Set(ordList.map((x) => x.paymentMethod).filter(Boolean))];
+      // Payment label from paid orders only — ignore null method on open/pending lines.
+      const paymentMethods = [...new Set(paidOrders.map((x) => x.paymentMethod).filter(Boolean))];
       const paymentDisplay =
         paymentMethods.length === 0
           ? "—"
           : paymentMethods.length <= 2
             ? paymentMethods.join(", ")
             : `${paymentMethods[0]} · +${paymentMethods.length - 1}`;
-      const subtotalG = round2(ordList.reduce((s, x) => s + x.subtotal, 0));
-      const discountG = round2(ordList.reduce((s, x) => s + x.discount, 0));
-      const complimentaryG = round2(ordList.reduce((s, x) => s + x.complimentary, 0));
-      const taxG = round2(ordList.reduce((s, x) => s + x.tax, 0));
-      const cardG = round2(ordList.reduce((s, x) => s + x.cardSurcharge, 0));
-      const totalG = round2(ordList.reduce((s, x) => s + x.total, 0));
+      // Financial rollups count PAID only so a stale pending void gap cannot inflate GCash/cash totals.
+      const rollup = paidOrders.length > 0 ? paidOrders : [];
+      const subtotalG = round2(rollup.reduce((s, x) => s + x.subtotal, 0));
+      const discountG = round2(rollup.reduce((s, x) => s + x.discount, 0));
+      const complimentaryG = round2(rollup.reduce((s, x) => s + x.complimentary, 0));
+      const taxG = round2(rollup.reduce((s, x) => s + x.tax, 0));
+      const cardG = round2(rollup.reduce((s, x) => s + x.cardSurcharge, 0));
+      const totalG = round2(rollup.reduce((s, x) => s + x.total, 0));
       const sessionId = head.sessionId;
       const sessionLabel =
         sessionId != null
@@ -4545,13 +4578,14 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
     for (const g of groups) delete g._sortMs;
 
     const listForResponse = list.map(forApi);
+    const paidForSummary = listForResponse.filter((o) => o.status === "paid");
     const totalOrders = listForResponse.length;
     const totalSessions = groups.length;
-    const totalSales = listForResponse.reduce((s, o) => s + o.total, 0);
-    const totalDiscounts = listForResponse.reduce((s, o) => s + o.discount, 0);
-    const totalComplimentary = listForResponse.reduce((s, o) => s + o.complimentary, 0);
-    const totalTax = listForResponse.reduce((s, o) => s + o.tax, 0);
-    const totalCardSurcharge = listForResponse.reduce((s, o) => s + o.cardSurcharge, 0);
+    const totalSales = paidForSummary.reduce((s, o) => s + o.total, 0);
+    const totalDiscounts = paidForSummary.reduce((s, o) => s + o.discount, 0);
+    const totalComplimentary = paidForSummary.reduce((s, o) => s + o.complimentary, 0);
+    const totalTax = paidForSummary.reduce((s, o) => s + o.tax, 0);
+    const totalCardSurcharge = paidForSummary.reduce((s, o) => s + o.cardSurcharge, 0);
     res.json({
       list: listForResponse,
       groups,
@@ -5998,10 +6032,21 @@ app.put("/api/payment-voids/:id", requireAnyPermission("void_payments"), async (
     }
     if (status === 'completed') {
       sql += `, completed_at = NOW()`;
-      // Also update the order status back to pending if voiding
+      // Re-open the order as unpaid: clear payment method and strip any card fee
+      // baked into total so sales report cannot treat the leftover as surcharge.
       const [voidInfo] = await db.execute(`SELECT order_id FROM payment_voids WHERE id = ?`, [voidId]);
       if (voidInfo[0]) {
-        await db.execute(`UPDATE orders SET status = 'pending' WHERE id = ?`, [voidInfo[0].order_id]);
+        const orderId = voidInfo[0].order_id;
+        await db.execute(
+          `UPDATE orders SET status = 'pending', payment_method = NULL, discount = 0 WHERE id = ?`,
+          [orderId]
+        );
+        try {
+          const settings = await loadPosFinancialSettings(db);
+          await updateOrderTotalsFromItems(db, orderId, settings);
+        } catch (recalcErr) {
+          console.error("Payment void totals recalc error:", recalcErr);
+        }
       }
     }
     
