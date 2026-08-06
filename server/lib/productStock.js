@@ -96,6 +96,32 @@ export async function consumeStockForPaidOrderIds(db, orderIds) {
   await consumeStockForItems(db, rows || []);
 }
 
+/**
+ * Restore stock for non-voided lines on orders whose payment is being voided
+ * (inventory was consumed at pay time).
+ */
+export async function restoreStockForPaidOrderIds(db, orderIds) {
+  const ids = (orderIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) return;
+  const placeholders = ids.map(() => "?").join(",");
+  let rows;
+  try {
+    [rows] = await db.execute(
+      `SELECT product_id AS productId, quantity FROM order_items
+       WHERE order_id IN (${placeholders}) AND COALESCE(is_voided,0) = 0 AND product_id IS NOT NULL`,
+      ids
+    );
+  } catch (e) {
+    if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+    [rows] = await db.execute(
+      `SELECT product_id AS productId, quantity FROM order_items
+       WHERE order_id IN (${placeholders}) AND product_id IS NOT NULL`,
+      ids
+    );
+  }
+  await restoreStockForItems(db, rows || []);
+}
+
 /** Restore stock (voids). */
 export async function restoreStockForItems(db, items) {
   for (const item of items || []) {

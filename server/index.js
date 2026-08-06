@@ -31,10 +31,8 @@ import { allocateOrderNumber, formatOrderDisplayNumber } from "./lib/orderNumber
 import {
   normalizePaymentMethod,
   isCardPaymentMethod,
-  SALES_CASH_COND,
-  SALES_CARD_COND,
-  SALES_GCASH_COND,
-  SALES_BANK_COND,
+  getShiftTenderSales,
+  getShiftChargeCollections,
 } from "./lib/paymentMethods.js";
 import {
   fetchOrderItemsByOrderIds,
@@ -42,12 +40,15 @@ import {
   mapOrderHeaderRow,
 } from "./lib/orderQueries.js";
 import { getWaiterDayStats } from "./lib/waiterStats.js";
+import { localDateString } from "./lib/localDate.js";
+import { buildRevenueDayFilter, buildTimestampDayFilter, REVENUE_DAY_SESSION_JOIN } from "./lib/revenueDay.js";
 import {
   ensureTableSessionsSchema,
   ensureSessionForOrder,
   closeOpenSessionForTable,
   vacateTableIfIdle,
   transferOpenSession,
+  swapOpenSessions,
   mergeSessions,
   migrateLegacySessions,
   attachOrderToSession,
@@ -71,6 +72,7 @@ import {
   ensureProductStockSchema,
   getStockMap,
   consumeStockForPaidOrderIds,
+  restoreStockForPaidOrderIds,
   setStockQty,
   migrateProductStock,
 } from "./lib/productStock.js";
@@ -78,6 +80,7 @@ import {
   ensureVoidLogSchema,
   logVoidsForOrderItems,
   logVoidsForOrder,
+  logPaymentVoidForOrder,
   backfillLegacyVoids,
   normalizeVoidReason,
 } from "./lib/voidLog.js";
@@ -242,6 +245,10 @@ function toSqlDateString(val) {
 
 /** Attribute LD order_items to a staff user (served_by = users.id, else order opener code). */
 const PAYROLL_LD_STAFF_SQL = "(oi.served_by = ? OR (oi.served_by IS NULL AND o.employee_id = ?))";
+/** LD lines on paid and open (pending) tabs count toward daily payroll. */
+const PAYROLL_LD_STATUS_SQL = "o.status IN ('pending','paid')";
+/** Complimentary LD does not earn commission/incentive. */
+const PAYROLL_LD_NON_COMP_SQL = "COALESCE(oi.is_complimentary, 0) = 0";
 
 /** Floor areas shown in Dashboard/POS and payroll LD breakdown (excludes LD room). */
 const PAYROLL_FLOOR_AREAS_SQL = "'Lounge', 'Club'";
@@ -298,15 +305,18 @@ async function buildPayrollLdTableBreakdown(db, branchId, dateClause, dateParams
             SUM(oi.quantity) AS ldCount
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
+     ${REVENUE_DAY_SESSION_JOIN}
      WHERE o.branch_id = ? AND oi.department = 'LD'
        AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
        AND COALESCE(oi.is_voided,0) = 0
+       AND ${PAYROLL_LD_NON_COMP_SQL}
        AND ${PAYROLL_LD_STAFF_SQL}
      GROUP BY o.table_id`,
     `SELECT COALESCE(o.table_id, '—') AS tableId,
             SUM(oi.quantity) AS ldCount
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
+     ${REVENUE_DAY_SESSION_JOIN}
      WHERE o.branch_id = ? AND oi.department = 'LD'
        AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
        AND ${PAYROLL_LD_STAFF_SQL}
@@ -719,6 +729,105 @@ async function updateOrderTotalsFromItems(db, orderId, settings = null) {
   return computed;
 }
 
+/** Persist paid order money fields; includes service_charge / card_surcharge when columns exist. */
+async function persistPaidOrderFinancials(db, {
+  orderId,
+  paymentMethod,
+  discount = 0,
+  tax = 0,
+  serviceCharge = 0,
+  cardSurcharge = 0,
+  total,
+}) {
+  try {
+    await db.execute(
+      `UPDATE orders SET status = 'paid', payment_method = ?, discount = ?, tax = ?,
+        service_charge = ?, card_surcharge = ?, total = ? WHERE id = ?`,
+      [paymentMethod, discount, tax, serviceCharge, cardSurcharge, total, orderId]
+    );
+  } catch (e) {
+    if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+    await db.execute(
+      `UPDATE orders SET status = 'paid', payment_method = ?, discount = ?, tax = ?, total = ? WHERE id = ?`,
+      [paymentMethod, discount, tax, total, orderId]
+    );
+  }
+}
+
+/**
+ * When a paid order is payment-voided, cancel or shrink matching pending charge/utang rows
+ * so AR does not keep a bill that was reversed.
+ */
+async function reconcileChargesAfterPaymentVoid(db, branchId, orderId, orderTotal) {
+  const oid = String(orderId);
+  let charges;
+  try {
+    [charges] = await db.execute(
+      `SELECT id, order_ids, amount, notes FROM charge_transactions
+       WHERE branch_id = ? AND status = 'pending'
+         AND FIND_IN_SET(?, REPLACE(COALESCE(order_ids, ''), ' ', '')) > 0`,
+      [branchId, oid]
+    );
+  } catch (e) {
+    if (e.code === "ER_NO_SUCH_TABLE" || e.code === "ER_BAD_FIELD_ERROR") return 0;
+    throw e;
+  }
+  let touched = 0;
+  for (const c of charges || []) {
+    const ids = String(c.order_ids || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const remaining = ids.filter((id) => String(id) !== oid);
+    const noteSuffix = " [cancelled/adjusted: payment void]";
+    if (!remaining.length) {
+      try {
+        await db.execute(
+          `UPDATE charge_transactions
+           SET status = 'cancelled',
+               notes = LEFT(CONCAT(COALESCE(notes, ''), ?), 255)
+           WHERE id = ? AND branch_id = ?`,
+          [noteSuffix, c.id, branchId]
+        );
+      } catch (e) {
+        if (e.code === "ER_BAD_FIELD_ERROR" || e.code === "ER_TRUNCATED_WRONG_VALUE_FOR_FIELD" || e.code === "ER_WRONG_VALUE_FOR_TYPE") {
+          // Older ENUM without cancelled — delete the orphan AR row
+          await db.execute(`DELETE FROM charge_transactions WHERE id = ? AND branch_id = ? AND status = 'pending'`, [
+            c.id,
+            branchId,
+          ]);
+        } else throw e;
+      }
+    } else {
+      const newAmount = Math.max(0, Math.round((Number(c.amount) - Number(orderTotal || 0)) * 100) / 100);
+      await db.execute(
+        `UPDATE charge_transactions
+         SET order_ids = ?, amount = ?,
+             notes = LEFT(CONCAT(COALESCE(notes, ''), ?), 255)
+         WHERE id = ? AND branch_id = ?`,
+        [remaining.join(","), newAmount, noteSuffix, c.id, branchId]
+      );
+    }
+    touched += 1;
+  }
+  return touched;
+}
+
+async function sumShiftCashConversions(db, shiftId) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT COALESCE(SUM(amount), 0) AS total
+       FROM payment_conversions
+       WHERE shift_id = ? AND LOWER(to_method) = 'cash'`,
+      [shiftId]
+    );
+    return Number(rows[0]?.total || 0);
+  } catch (e) {
+    if (e.code === "ER_NO_SUCH_TABLE" || e.code === "ER_BAD_FIELD_ERROR") return 0;
+    throw e;
+  }
+}
+
 async function resolveTableArea(db, branchId, tableId) {
   const [rows] = await db.execute(
     "SELECT area FROM pos_tables WHERE branch_id = ? AND id = ? LIMIT 1",
@@ -971,36 +1080,41 @@ async function resolveCurrentPayrollPeriod(db, branchId) {
       toDate: toSqlDateString(rows[0].periodTo),
     };
   }
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDateString();
   return { fromDate: today, toDate: today };
 }
 
-/** LD lines on paid and open (pending) tabs count toward daily payroll. */
-const PAYROLL_LD_STATUS_SQL = "o.status IN ('pending','paid')";
+/** LD lines on paid and open (pending) tabs count toward daily payroll — see PAYROLL_LD_* near top. */
 
 async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartHour = null) {
   const startHour =
     dayStartHour != null
       ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
       : null;
-  const hourPad = startHour != null ? String(startHour).padStart(2, "0") : null;
-  const dateClause =
-    startHour != null
-      ? `o.created_at >= CONCAT(?, ' ', ?, ':00:00') AND o.created_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00')`
-      : `o.order_date BETWEEN ? AND ?`;
-  const dateParams = startHour != null ? [fromDate, hourPad, toDate, hourPad] : [fromDate, toDate];
+  const { sql: dateSql, params: dateParams } = buildRevenueDayFilter({
+    startHour,
+    fromDate,
+    toDate,
+    noSessionTsCol: "o.created_at",
+    noSessionDateCol: "o.order_date",
+  });
+  // dateSql already includes leading AND; strip for WHERE-first usage after JOINs
+  const dateClause = dateSql.replace(/^\s*AND\s*/, "");
 
   const totalLdRows = await queryWithVoidFallback(
     db,
     `SELECT COALESCE(SUM(oi.quantity),0) AS totalLd
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
+     ${REVENUE_DAY_SESSION_JOIN}
      WHERE o.branch_id = ? AND oi.department = 'LD'
        AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
-       AND COALESCE(oi.is_voided,0) = 0`,
+       AND COALESCE(oi.is_voided,0) = 0
+       AND ${PAYROLL_LD_NON_COMP_SQL}`,
     `SELECT COALESCE(SUM(oi.quantity),0) AS totalLd
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
+     ${REVENUE_DAY_SESSION_JOIN}
      WHERE o.branch_id = ? AND oi.department = 'LD'
        AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}`,
     [branchId, ...dateParams]
@@ -1021,27 +1135,68 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
               COALESCE(SUM(oi.subtotal),0) AS ldAmount
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
          AND COALESCE(oi.is_voided,0) = 0
-         AND COALESCE(oi.served_by, o.employee_id) = ?`,
+         AND ${PAYROLL_LD_NON_COMP_SQL}
+         AND ${PAYROLL_LD_STAFF_SQL}`,
       `SELECT COALESCE(SUM(oi.quantity),0) AS ldCount,
               COALESCE(SUM(oi.subtotal),0) AS ldAmount
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
-         AND COALESCE(oi.served_by, o.employee_id) = ?`,
-      [branchId, ...dateParams, staff.id]
+         AND ${PAYROLL_LD_STAFF_SQL}`,
+      [branchId, ...dateParams, staff.id, staff.employee_id]
     );
 
     const ldCount = Number(ldRows[0]?.ldCount || 0);
     const ldAmount = Number(ldRows[0]?.ldAmount || 0);
     const commissionRate = Number(staff.commission_rate || 0);
-    const commission = ldCount * commissionRate;
     const rate = Number(staff.incentive_rate || 0);
-    const incentives = totalLdAll * rate;
+    const tableIncentiveRate = Number(staff.table_incentive || 0);
+    const hasQuota = !!staff.has_quota;
+    const quotaAmount = Number(staff.quota_amount || 0);
     const budget = Number(staff.budget || 0);
+
+    // Distinct tables where this staff had LD (matches ld-by-table / Lounge+Club attribution).
+    let tableCount = 0;
+    try {
+      const tableRows = await queryWithVoidFallback(
+        db,
+        `SELECT COUNT(DISTINCT o.table_id) AS tableCount
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         ${REVENUE_DAY_SESSION_JOIN}
+         WHERE o.branch_id = ? AND oi.department = 'LD'
+           AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+           AND COALESCE(oi.is_voided,0) = 0
+           AND ${PAYROLL_LD_NON_COMP_SQL}
+           AND ${PAYROLL_LD_STAFF_SQL}
+           AND o.table_id IS NOT NULL AND o.table_id <> ''`,
+        `SELECT COUNT(DISTINCT o.table_id) AS tableCount
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         ${REVENUE_DAY_SESSION_JOIN}
+         WHERE o.branch_id = ? AND oi.department = 'LD'
+           AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+           AND ${PAYROLL_LD_STAFF_SQL}
+           AND o.table_id IS NOT NULL AND o.table_id <> ''`,
+        [branchId, ...dateParams, staff.id, staff.employee_id]
+      );
+      tableCount = Number(tableRows[0]?.tableCount || tableRows[0]?.tablecount || 0);
+    } catch (_) {
+      tableCount = 0;
+    }
+
+    // Quota gates commission / incentives / table pay when enabled (target = LD sales amount).
+    const quotaReached = !hasQuota || ldAmount + 0.009 >= quotaAmount;
+    let commission = quotaReached ? ldCount * commissionRate : 0;
+    let branchIncentives = quotaReached ? totalLdAll * rate : 0;
+    let tablePay = quotaReached ? tableCount * tableIncentiveRate : 0;
+    const incentives = branchIncentives + tablePay;
 
     const [existing] = await db.execute(
       `SELECT id, incentives_breakdown, adjustments, deductions FROM payouts WHERE user_id = ? AND period_from = ? AND period_to = ?`,
@@ -1079,6 +1234,11 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
       commission,
       ldCount,
       ldAmount,
+      tableCount,
+      tablePay,
+      quotaReached,
+      hasQuota,
+      quotaAmount,
       incentives,
       total,
     });
@@ -1248,7 +1408,7 @@ app.post("/api/auth/login", async (req, res) => {
 
     // Auto clock-in: create attendance record for today if none exists
     try {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localDateString();
       const now = new Date();
       const [existing] = await db.execute(
         "SELECT 1 FROM attendance WHERE user_id = ? AND work_date = ?",
@@ -1337,7 +1497,7 @@ app.get("/api/dashboard/stats", requireAnyPermission("view_dashboard", "manage_p
   const branchId = getBranchId(req);
   try {
     const db = await getPool();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const [ordersCount] = await db.execute(
       "SELECT COUNT(*) AS c FROM orders WHERE branch_id = ? AND order_date = ?",
       [branchId, today]
@@ -1361,7 +1521,8 @@ app.get("/api/dashboard/stats", requireAnyPermission("view_dashboard", "manage_p
         `SELECT COALESCE(SUM(oi.subtotal),0) AS s FROM order_items oi
          JOIN orders o ON o.id = oi.order_id
          WHERE o.branch_id = ? AND o.order_date = ? AND o.status = 'paid'
-           AND oi.department = 'LD' AND COALESCE(oi.is_voided,0) = 0`,
+           AND oi.department = 'LD' AND COALESCE(oi.is_voided,0) = 0
+           AND COALESCE(oi.is_complimentary,0) = 0`,
         `SELECT COALESCE(SUM(oi.subtotal),0) AS s FROM order_items oi
          JOIN orders o ON o.id = oi.order_id
          WHERE o.branch_id = ? AND o.order_date = ? AND o.status = 'paid'
@@ -1519,7 +1680,7 @@ app.post("/api/orders", requireAnyPermission("create_orders", "manage_pos"), asy
     }
     conn = await db.getConnection();
     await conn.beginTransaction();
-    const orderDate = new Date().toISOString().slice(0, 10);
+    const orderDate = localDateString();
     const settings = await loadPosFinancialSettings(conn);
     // Check if this is the first order of a fresh seating (table was available)
     const [tableRow] = await conn.execute(
@@ -2456,47 +2617,191 @@ app.patch("/api/order-items/:id/complimentary", requireAnyPermission("accept_pay
   }
 });
 
-// Pay single order (legacy; for single-order flow)
+// Pay single order (same bill math as pay-all / bill-preview for one order)
 app.patch("/api/orders/:id/pay", requireAnyPermission("accept_payments", "manage_pos"), async (req, res) => {
   const { id } = req.params;
   const branchId = getBranchId(req);
-  const { paymentMethod } = req.body || {};
+  const { paymentMethod, discountAmount, customerName, splits, amountReceived } = req.body || {};
   let conn;
   try {
     const db = await getPool();
     conn = await db.getConnection();
     await conn.beginTransaction();
-    const [orders] = await conn.execute("SELECT branch_id, table_id, status FROM orders WHERE id = ? FOR UPDATE", [id]);
+    const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+    const [orders] = await conn.execute(
+      "SELECT id, branch_id, table_id, status, subtotal, discount, tax, total, employee_id FROM orders WHERE id = ? FOR UPDATE",
+      [id]
+    );
     if (!orders.length) {
       await conn.rollback();
       return res.status(404).json({ error: "Order not found" });
     }
-    const orderBranchId = String(orders[0].branch_id);
-    if (orderBranchId !== branchId) {
+    const order = orders[0];
+    if (String(order.branch_id) !== String(branchId)) {
       await conn.rollback();
       return res.status(403).json({ error: "Order belongs to another branch" });
     }
-    if (String(orders[0].status) === "paid") {
+    if (String(order.status) === "paid") {
       await conn.rollback();
       return res.status(400).json({ error: "Order already paid" });
     }
-    await conn.execute("UPDATE orders SET status = 'paid', payment_method = ? WHERE id = ?", [normalizePaymentMethod(paymentMethod), id]);
+
+    let voidedAt = null;
+    try {
+      const [v] = await conn.execute("SELECT voided_at FROM orders WHERE id = ?", [id]);
+      voidedAt = v[0]?.voided_at ?? null;
+    } catch (e) {
+      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+    }
+    if (voidedAt != null) {
+      await conn.rollback();
+      return res.status(400).json({ error: "Cannot pay a voided order" });
+    }
+
+    const isSplitPayment = Array.isArray(splits) && splits.length >= 2;
+    const paymentMethodVal = isSplitPayment
+      ? "split_payment"
+      : normalizePaymentMethod(paymentMethod || "cash");
+    const manualAmountPayment = !isSplitPayment && /^(cash|gcash|bank|debit|credit)$/i.test(paymentMethodVal);
+
+    if (!isSplitPayment && paymentMethodVal === "charge") {
+      const name = String(customerName || "").trim();
+      if (!name) {
+        await conn.rollback();
+        return res.status(400).json({ error: "Customer name is required for Charge/Utang" });
+      }
+    }
+
+    const billSettings = await loadBillSettings(conn);
+    const posSettings = await loadPosFinancialSettings(conn);
+    const fresh = await updateOrderTotalsFromItems(conn, id, posSettings);
+    order.subtotal = fresh.subtotal;
+    order.tax = fresh.tax;
+    order.total = fresh.total;
+
+    const complimentaryByOrder = await loadComplimentaryByOrder(conn, [id]);
+    const bill = computeTableBillTotals({
+      pending: [order],
+      complimentaryByOrder,
+      ...billSettings,
+      discountAmount,
+      isSplitPayment,
+      paymentMethodVal,
+      splits,
+    });
+    const {
+      orderBases,
+      totalBaseTotal,
+      useAdjustedSplitMath,
+      paidSum,
+      combinedTotal,
+    } = bill;
+
+    if (isSplitPayment && paidSum <= 0) {
+      await conn.rollback();
+      return res.status(400).json({ error: "Split payment total must be greater than zero" });
+    }
+
+    const validationExpected = useAdjustedSplitMath ? combinedTotal : totalBaseTotal;
+    if (isSplitPayment && Math.abs(round2(paidSum) - round2(validationExpected)) >= 0.01) {
+      await conn.rollback();
+      return res.status(400).json({
+        error: "Split payment amounts must exactly match computed total",
+        expectedTotal: round2(validationExpected),
+        paidSum: round2(paidSum),
+      });
+    }
+
+    let changeAmount = 0;
+    let receivedAmount = combinedTotal;
+    if (manualAmountPayment && amountReceived != null && amountReceived !== "") {
+      receivedAmount = round2(Number(amountReceived));
+      if (!Number.isFinite(receivedAmount)) {
+        await conn.rollback();
+        return res.status(400).json({ error: "Payment amount is required" });
+      }
+      if (receivedAmount + 0.009 < combinedTotal) {
+        await conn.rollback();
+        return res.status(400).json({
+          error: "Payment amount is less than amount due",
+          amountDue: combinedTotal,
+          amountReceived: receivedAmount,
+        });
+      }
+      changeAmount = round2(Math.max(0, receivedAmount - combinedTotal));
+    }
+
+    const ob = orderBases[0];
+    await persistPaidOrderFinancials(conn, {
+      orderId: id,
+      paymentMethod: paymentMethodVal,
+      discount: ob.discount,
+      tax: ob.tax,
+      serviceCharge: ob.serviceCharge,
+      cardSurcharge: ob.cardSurcharge,
+      total: ob.total,
+    });
+
     try {
       await consumeStockForPaidOrderIds(conn, [id]);
     } catch (stockErr) {
       if (stockErr.code !== "ER_NO_SUCH_TABLE") throw stockErr;
     }
-    if (orders[0].table_id) {
-      // Keep session_id on the paid order (same seating). Only close session when table is idle.
-      await reconcileTableVisitIds(conn, branchId, orders[0].table_id);
+
+    if (isSplitPayment) {
+      try {
+        await conn.execute(`DELETE FROM split_payments WHERE order_id = ?`, [id]);
+        for (let i = 0; i < splits.length; i++) {
+          await conn.execute(
+            `INSERT INTO split_payments (order_id, split_number, amount, payment_method, status) VALUES (?, ?, ?, ?, 'paid')`,
+            [id, i + 1, splits[i].amount, normalizePaymentMethod(splits[i].paymentMethod)]
+          );
+        }
+      } catch (_splitErr) {
+        // split_payments table may not exist — non-fatal
+      }
+    }
+
+    if (paymentMethodVal === "charge" || (isSplitPayment && splits.some((s) => s.paymentMethod === "charge"))) {
+      // Charge/utang rows are created by pay-all; keep single-order charge minimal — insert if table exists
+      try {
+        if (paymentMethodVal === "charge") {
+          const { userName, employeeId: actingEmp } = getActingUser(req);
+          await conn.execute(
+            `INSERT INTO charge_transactions (branch_id, order_ids, customer_name, amount, status, charged_by)
+             VALUES (?, ?, ?, ?, 'pending', ?)`,
+            [branchId, String(id), String(customerName).trim(), ob.total, userName || actingEmp || null]
+          );
+        }
+      } catch (e) {
+        if (e.code !== "ER_NO_SUCH_TABLE" && e.code !== "ER_BAD_FIELD_ERROR") throw e;
+      }
+    }
+
+    if (order.table_id) {
+      await reconcileTableVisitIds(conn, branchId, order.table_id);
       const { userName, employeeId: actingEmp } = getActingUser(req);
-      await vacateTableIfIdle(conn, branchId, orders[0].table_id, {
+      await vacateTableIfIdle(conn, branchId, order.table_id, {
         closedBy: userName || actingEmp || "pay",
       });
     }
+
     await conn.commit();
-    await logAudit(req, "order_pay", "order", id, { paymentMethod: normalizePaymentMethod(paymentMethod), tableId: orders[0].table_id });
-    res.json({ ok: true });
+    await logAudit(req, "order_pay", "order", id, {
+      paymentMethod: paymentMethodVal,
+      tableId: order.table_id,
+      total: ob.total,
+      discount: ob.discount,
+    });
+    res.json({
+      ok: true,
+      total: ob.total,
+      discount: ob.discount,
+      tax: ob.tax,
+      changeAmount,
+      amountReceived: receivedAmount,
+    });
   } catch (err) {
     if (conn) {
       try { await conn.rollback(); } catch {}
@@ -2718,6 +3023,9 @@ app.post("/api/tables/:tableId/bill-preview", requireAnyPermission("accept_payme
     }
 
     const isSplitPayment = Array.isArray(splits) && splits.length >= 2;
+    const paymentMethodVal = isSplitPayment
+      ? "split_payment"
+      : normalizePaymentMethod(paymentMethod || "cash");
     const settings = await loadBillSettings(db);
     const posSettings = await loadPosFinancialSettings(db);
     for (const o of pending) {
@@ -2919,10 +3227,15 @@ app.post("/api/tables/:tableId/pay-all", requireAnyPermission("accept_payments",
 
     // Persist payment only after validation succeeds
     for (const ob of orderBases) {
-      await conn.execute(
-        "UPDATE orders SET status = 'paid', payment_method = ?, discount = ?, tax = ?, total = ? WHERE id = ?",
-        [paymentMethodVal, ob.discount, ob.tax, ob.total, ob.id]
-      );
+      await persistPaidOrderFinancials(conn, {
+        orderId: ob.id,
+        paymentMethod: paymentMethodVal,
+        discount: ob.discount,
+        tax: ob.tax,
+        serviceCharge: ob.serviceCharge,
+        cardSurcharge: ob.cardSurcharge,
+        total: ob.total,
+      });
     }
     try {
       await consumeStockForPaidOrderIds(conn, pendingIds);
@@ -4201,7 +4514,7 @@ app.post("/api/reports/save-print", requireAnyPermission("view_reports", "print_
 app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, res) => {
   const branchId = getBranchId(req);
   const { from, to, dayStartHour, tableId, waiterId, sessionId } = req.query;
-  const fromDate = from || new Date().toISOString().slice(0, 10);
+  const fromDate = from || localDateString();
   const toDate = to || fromDate;
   const startHour = dayStartHour != null ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0)) : null;
   const filterTableId = tableId != null && String(tableId).trim() !== "" ? String(tableId).trim() : null;
@@ -4225,6 +4538,7 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
     const computeServiceCharge = (baseAmount) =>
       serviceChargeMode === "fixed" ? serviceChargeValue : round2(baseAmount * (serviceChargeValue / 100));
     const sqlRest = ` t.area, t.name AS tableName, o.status, o.subtotal, o.discount, o.tax, o.total, o.payment_method AS paymentMethod,
+              o.service_charge AS serviceCharge, o.card_surcharge AS cardSurchargeStored,
               o.employee_id AS employeeId, u.name AS employeeName, u.nickname AS employeeNickname,
               o.order_date AS orderDate, o.created_at AS time, o.updated_at AS updatedAt,
               ts.opened_at AS sessionOpenedAt, ts.closed_at AS sessionClosedAt, ts.status AS sessionStatus,
@@ -4237,28 +4551,14 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
        LEFT JOIN users wu ON wu.employee_id = ts.waiter_id
        WHERE o.branch_id = ?`;
     const params = [branchId];
-    let dateSql = "";
-    if (startHour != null && !isNaN(startHour)) {
-      const hourPad = String(startHour).padStart(2, "0");
-      // Prefer session close time for revenue day; fall back to open time / order created_at
-      dateSql = ` AND (
-        (ts.closed_at IS NOT NULL AND ts.closed_at >= CONCAT(?, ' ', ?, ':00:00') AND ts.closed_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00'))
-        OR (ts.closed_at IS NULL AND ts.opened_at IS NOT NULL AND ts.opened_at >= CONCAT(?, ' ', ?, ':00:00') AND ts.opened_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00'))
-        OR (o.session_id IS NULL AND o.created_at >= CONCAT(?, ' ', ?, ':00:00') AND o.created_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00'))
-      )`;
-      params.push(
-        fromDate, hourPad, toDate, hourPad,
-        fromDate, hourPad, toDate, hourPad,
-        fromDate, hourPad, toDate, hourPad
-      );
-    } else {
-      dateSql = ` AND (
-        (ts.closed_at IS NOT NULL AND DATE(ts.closed_at) BETWEEN ? AND ?)
-        OR (ts.closed_at IS NULL AND ts.opened_at IS NOT NULL AND DATE(ts.opened_at) BETWEEN ? AND ?)
-        OR (o.session_id IS NULL AND o.order_date BETWEEN ? AND ?)
-      )`;
-      params.push(fromDate, toDate, fromDate, toDate, fromDate, toDate);
-    }
+    const { sql: dateSql, params: dateParams } = buildRevenueDayFilter({
+      startHour,
+      fromDate,
+      toDate,
+      noSessionTsCol: "o.created_at",
+      noSessionDateCol: "o.order_date",
+    });
+    params.push(...dateParams);
     let filterSql = "";
     if (filterTableId) {
       filterSql += ` AND o.table_id = ?`;
@@ -4287,6 +4587,7 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
       if (e.code !== "ER_BAD_FIELD_ERROR" && e.code !== "ER_NO_SUCH_TABLE") throw e;
       // Fallback without table_sessions / session_id
       const sqlRestLegacy = ` t.area, t.name AS tableName, o.status, o.subtotal, o.discount, o.tax, o.total, o.payment_method AS paymentMethod,
+              NULL AS serviceCharge, NULL AS cardSurchargeStored,
               o.employee_id AS employeeId, u.name AS employeeName, u.nickname AS employeeNickname,
               o.order_date AS orderDate, o.created_at AS time, o.updated_at AS updatedAt,
               NULL AS sessionOpenedAt, NULL AS sessionClosedAt, NULL AS sessionStatus,
@@ -4396,8 +4697,11 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
       const splitPaidAmount = Number(splitPaidMap[String(r.id)] || 0);
       const method = String(r.paymentMethod || "").toLowerCase();
       const orderTotal = Number(r.total || 0);
+      const storedCard = r.cardSurchargeStored != null ? Number(r.cardSurchargeStored) : null;
       let estimatedCardSurcharge = 0;
-      if (method === "credit" || method === "debit") {
+      if (storedCard != null && Number.isFinite(storedCard) && storedCard >= 0) {
+        estimatedCardSurcharge = round2(storedCard);
+      } else if (method === "credit" || method === "debit") {
         const divisor = 1 + cardSurchargeRate;
         estimatedCardSurcharge = cardSurchargeRate > 0 ? round2(orderTotal - orderTotal / divisor) : 0;
       } else if (method === "split_payment" && splitPaidAmount > 0 && cardSurchargeRate > 0) {
@@ -4409,8 +4713,11 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
       const complimentary = Number(complimentaryMap[String(r.id)] || 0);
       const chargeableSubtotal = Math.max(0, itemSubtotal - complimentary);
       const taxableBase = Math.max(0, chargeableSubtotal - Number(r.discount || 0));
-      const expectedService = computeServiceCharge(taxableBase);
-      if (estimatedCardSurcharge <= 0 && cardSurchargeRate > 0 && method !== "cash" && method !== "gcash" && method !== "bank" && method !== "charge" && method !== "split_payment") {
+      const storedService = r.serviceCharge != null ? Number(r.serviceCharge) : null;
+      const expectedService = storedService != null && Number.isFinite(storedService)
+        ? round2(storedService)
+        : computeServiceCharge(taxableBase);
+      if (estimatedCardSurcharge <= 0 && (storedCard == null || !Number.isFinite(storedCard)) && cardSurchargeRate > 0 && method !== "cash" && method !== "gcash" && method !== "bank" && method !== "charge" && method !== "split_payment") {
         const inferred = round2(orderTotal - taxableBase - expectedService - rawTax);
         estimatedCardSurcharge = Math.max(0, inferred);
       }
@@ -4439,6 +4746,7 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
         discount: Number(r.discount),
         complimentary,
         tax: displayTax,
+        serviceCharge: expectedService,
         cardSurcharge: estimatedCardSurcharge,
         total: adjustedTotal,
         status: r.status,
@@ -4479,8 +4787,8 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
       const anyPending = activeOrders.some((x) => x.status === "pending");
       const isSessionClosed = head.sessionStatus === "closed" || (!anyPending && activeOrders.length > 0);
       const sessionStatus = head.sessionStatus || (isSessionClosed ? "closed" : "open");
-      // Session displays paid when all active orders are paid or session is closed.
-      const status = allPaid || head.sessionStatus === "closed" ? "paid" : "pending";
+      // Never force "paid" just because the session closed — unpaid tabs stay pending.
+      const status = allPaid ? "paid" : "pending";
       const openedMs = head.sessionOpenedAt ? new Date(head.sessionOpenedAt).getTime() : Math.min(...ordList.map((x) => x.timeMs));
       const closedMs = head.sessionClosedAt
         ? new Date(head.sessionClosedAt).getTime()
@@ -4498,12 +4806,16 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
           : paymentMethods.length <= 2
             ? paymentMethods.join(", ")
             : `${paymentMethods[0]} · +${paymentMethods.length - 1}`;
-      const subtotalG = round2(ordList.reduce((s, x) => s + x.subtotal, 0));
-      const discountG = round2(ordList.reduce((s, x) => s + x.discount, 0));
-      const complimentaryG = round2(ordList.reduce((s, x) => s + x.complimentary, 0));
-      const taxG = round2(ordList.reduce((s, x) => s + x.tax, 0));
-      const cardG = round2(ordList.reduce((s, x) => s + x.cardSurcharge, 0));
-      const totalG = round2(ordList.reduce((s, x) => s + x.total, 0));
+      const paidList = ordList.filter((x) => x.status === "paid");
+      const subtotalG = round2(paidList.reduce((s, x) => s + x.subtotal, 0));
+      const discountG = round2(paidList.reduce((s, x) => s + x.discount, 0));
+      const complimentaryG = round2(paidList.reduce((s, x) => s + x.complimentary, 0));
+      const taxG = round2(paidList.reduce((s, x) => s + x.tax, 0));
+      const cardG = round2(paidList.reduce((s, x) => s + x.cardSurcharge, 0));
+      const totalG = round2(paidList.reduce((s, x) => s + x.total, 0));
+      const openTabsTotalG = round2(
+        ordList.filter((x) => x.status === "pending").reduce((s, x) => s + x.total, 0)
+      );
       const sessionId = head.sessionId;
       const sessionLabel =
         sessionId != null
@@ -4535,6 +4847,7 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
         tax: taxG,
         cardSurcharge: cardG,
         total: totalG,
+        openTabsTotal: openTabsTotalG,
         status,
         time: timeRange,
         orders: ordList.map(forApi),
@@ -4545,24 +4858,32 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
     for (const g of groups) delete g._sortMs;
 
     const listForResponse = list.map(forApi);
+    const paidForMoney = listForResponse.filter((o) => o.status === "paid");
+    const pendingForMoney = listForResponse.filter((o) => o.status === "pending");
     const totalOrders = listForResponse.length;
     const totalSessions = groups.length;
-    const totalSales = listForResponse.reduce((s, o) => s + o.total, 0);
-    const totalDiscounts = listForResponse.reduce((s, o) => s + o.discount, 0);
-    const totalComplimentary = listForResponse.reduce((s, o) => s + o.complimentary, 0);
-    const totalTax = listForResponse.reduce((s, o) => s + o.tax, 0);
-    const totalCardSurcharge = listForResponse.reduce((s, o) => s + o.cardSurcharge, 0);
+    const totalSales = paidForMoney.reduce((s, o) => s + o.total, 0);
+    const totalDiscounts = paidForMoney.reduce((s, o) => s + o.discount, 0);
+    const totalComplimentary = paidForMoney.reduce((s, o) => s + o.complimentary, 0);
+    const totalTax = paidForMoney.reduce((s, o) => s + o.tax, 0);
+    const totalCardSurcharge = paidForMoney.reduce((s, o) => s + o.cardSurcharge, 0);
+    const openTabsCount = pendingForMoney.length;
+    const openTabsTotal = pendingForMoney.reduce((s, o) => s + o.total, 0);
+    const paidOrders = paidForMoney.length;
     res.json({
       list: listForResponse,
       groups,
       summary: {
         totalOrders,
         totalSessions,
+        paidOrders,
         totalSales,
         totalDiscounts,
         totalComplimentary,
         totalTax,
         totalCardSurcharge,
+        openTabsCount,
+        openTabsTotal,
       },
     });
   } catch (err) {
@@ -4571,11 +4892,11 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
   }
 });
 
-// Product report: consumed/sold only (paid, non-voided), consolidated by SKU
+// Product report: consumed/sold only (paid, non-voided, non-comp), consolidated by SKU
 app.get("/api/reports/products", requireAnyPermission("view_reports"), async (req, res) => {
   const branchId = getBranchId(req);
   const { from, to, dayStartHour, sku, category, tableId, sessionId, sortBy, sortDir } = req.query;
-  const fromDate = from || new Date().toISOString().slice(0, 10);
+  const fromDate = from || localDateString();
   const toDate = to || fromDate;
   const startHour = dayStartHour != null ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0)) : null;
   const filterSku = sku != null && String(sku).trim() !== "" ? String(sku).trim() : null;
@@ -4594,17 +4915,17 @@ app.get("/api/reports/products", requireAnyPermission("view_reports"), async (re
     const db = await getPool();
     const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
     const params = [branchId];
-    // Paid only; date = bill-out day (updated_at when operational hour set, else order_date)
-    let dateSql = "";
-    if (startHour != null && !isNaN(startHour)) {
-      const hourPad = String(startHour).padStart(2, "0");
-      dateSql = ` AND o.updated_at >= CONCAT(?, ' ', ?, ':00:00') AND o.updated_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00')`;
-      params.push(fromDate, hourPad, toDate, hourPad);
-    } else {
-      dateSql = ` AND o.order_date BETWEEN ? AND ?`;
-      params.push(fromDate, toDate);
-    }
-    let filterSql = ` AND o.status = 'paid' AND o.voided_at IS NULL AND COALESCE(oi.is_voided, 0) = 0`;
+    // Same revenue-day rule as Sales (session close → open → no-session fallback).
+    // Paid-only: no-session fallback uses updated_at / order_date (bill-out day).
+    const { sql: dateSql, params: dateParams } = buildRevenueDayFilter({
+      startHour,
+      fromDate,
+      toDate,
+      noSessionTsCol: "o.updated_at",
+      noSessionDateCol: "o.order_date",
+    });
+    params.push(...dateParams);
+    let filterSql = ` AND o.status = 'paid' AND o.voided_at IS NULL AND COALESCE(oi.is_voided, 0) = 0 AND COALESCE(oi.is_complimentary, 0) = 0`;
     if (filterSku) {
       filterSql += ` AND (oi.product_sku LIKE ? OR p.sku LIKE ? OR p.name LIKE ? OR oi.product_name LIKE ?)`;
       const likeFilter = `%${filterSku}%`;
@@ -4639,6 +4960,7 @@ app.get("/api/reports/products", requireAnyPermission("view_reports"), async (re
             SUM(oi.subtotal) AS revenue
          FROM order_items oi
          INNER JOIN orders o ON o.id = oi.order_id
+         ${REVENUE_DAY_SESSION_JOIN}
          LEFT JOIN products p ON p.id = oi.product_id
          LEFT JOIN product_prices pp ON pp.id = oi.product_price_id
          WHERE o.branch_id = ?
@@ -4660,7 +4982,7 @@ app.get("/api/reports/products", requireAnyPermission("view_reports"), async (re
         legacyDate = ` AND o.order_date BETWEEN ? AND ?`;
         legacyParams.push(fromDate, toDate);
       }
-      let legacyFilter = ` AND o.status = 'paid' AND COALESCE(oi.is_voided, 0) = 0`;
+      let legacyFilter = ` AND o.status = 'paid' AND COALESCE(oi.is_voided, 0) = 0 AND COALESCE(oi.is_complimentary, 0) = 0`;
       if (filterSku) {
         legacyFilter += ` AND (p.sku LIKE ? OR p.name LIKE ? OR oi.product_name LIKE ?)`;
         const likeFilter = `%${filterSku}%`;
@@ -4830,54 +5152,81 @@ app.post("/api/system/create-shortcut", requireAnyPermission("manage_settings"),
 // Void report — Manager/Admin only (approve_voids or view_audit_logs)
 app.get("/api/reports/voids", requireAnyPermission("approve_voids", "view_audit_logs"), async (req, res) => {
   const branchId = getBranchId(req);
-  const { from, to, staffId, staffName, product, tableId, q } = req.query;
-  const fromDate = from || new Date().toISOString().slice(0, 10);
+  const { from, to, dayStartHour, staffId, staffName, product, tableId, q, limit } = req.query;
+  const fromDate = from || localDateString();
   const toDate = to || fromDate;
+  const startHour =
+    dayStartHour != null
+      ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
+      : null;
+  const listLimit = Math.min(50000, Math.max(100, parseInt(String(limit || "10000"), 10) || 10000));
   try {
     const db = await getPool();
-    const params = [branchId, fromDate, toDate];
-    let sql = `
-      SELECT vl.id, vl.void_type AS voidType, vl.order_id AS orderId, vl.order_item_id AS orderItemId,
-             vl.product_id AS productId, vl.product_sku AS productSku, vl.product_name AS productName,
-             vl.quantity, vl.unit_price AS unitPrice, vl.amount,
-             vl.table_id AS tableId, vl.session_id AS sessionId,
-             vl.voided_by AS voidedBy, vl.voided_by_name AS voidedByName,
-             vl.voided_by_employee_id AS voidedByEmployeeId,
-             vl.voided_at AS voidedAt, vl.reason,
-             t.name AS tableName, t.area AS tableArea
-      FROM void_log vl
-      LEFT JOIN pos_tables t ON t.branch_id = vl.branch_id AND t.id = vl.table_id
-      WHERE vl.branch_id = ?
-        AND DATE(vl.voided_at) BETWEEN ? AND ?
-    `;
+    const { sql: daySql, params: dayParams } = buildTimestampDayFilter({
+      col: "vl.voided_at",
+      startHour,
+      fromDate,
+      toDate,
+    });
+    const filterParams = [branchId, ...dayParams];
+    let filterSql = ` WHERE vl.branch_id = ? ${daySql}`;
     if (staffId != null && String(staffId).trim() !== "") {
-      sql += ` AND (vl.voided_by = ? OR vl.voided_by_employee_id = ?)`;
-      params.push(String(staffId).trim(), String(staffId).trim());
+      filterSql += ` AND (vl.voided_by = ? OR vl.voided_by_employee_id = ?)`;
+      filterParams.push(String(staffId).trim(), String(staffId).trim());
     }
     if (staffName != null && String(staffName).trim() !== "") {
-      sql += ` AND vl.voided_by_name LIKE ?`;
-      params.push(`%${String(staffName).trim()}%`);
+      filterSql += ` AND vl.voided_by_name LIKE ?`;
+      filterParams.push(`%${String(staffName).trim()}%`);
     }
     if (product != null && String(product).trim() !== "") {
       const p = `%${String(product).trim()}%`;
-      sql += ` AND (vl.product_name LIKE ? OR vl.product_sku LIKE ?)`;
-      params.push(p, p);
+      filterSql += ` AND (vl.product_name LIKE ? OR vl.product_sku LIKE ?)`;
+      filterParams.push(p, p);
     }
     if (tableId != null && String(tableId).trim() !== "") {
-      sql += ` AND vl.table_id = ?`;
-      params.push(String(tableId).trim());
+      filterSql += ` AND vl.table_id = ?`;
+      filterParams.push(String(tableId).trim());
     }
     if (q != null && String(q).trim() !== "") {
       const s = `%${String(q).trim()}%`;
-      sql += ` AND (
+      filterSql += ` AND (
         vl.product_name LIKE ? OR vl.product_sku LIKE ? OR vl.voided_by_name LIKE ?
         OR vl.reason LIKE ? OR vl.table_id LIKE ? OR CAST(vl.session_id AS CHAR) LIKE ?
       )`;
-      params.push(s, s, s, s, s, s);
+      filterParams.push(s, s, s, s, s, s);
     }
-    sql += ` ORDER BY vl.voided_at DESC, vl.id DESC LIMIT 2000`;
 
-    const [rows] = await db.execute(sql, params);
+    // Accurate totals even when the result list is capped.
+    const [aggRows] = await db.execute(
+      `SELECT COUNT(*) AS totalVoids,
+              COALESCE(SUM(vl.quantity), 0) AS totalQuantity,
+              COALESCE(SUM(vl.amount), 0) AS totalAmount
+       FROM void_log vl
+       ${filterSql}`,
+      filterParams
+    );
+    const agg = aggRows[0] || {};
+    const totalVoids = Number(agg.totalVoids || 0);
+    const totalQuantity = Number(agg.totalQuantity || 0);
+    const totalAmount = Math.round(Number(agg.totalAmount || 0) * 100) / 100;
+
+    const listParams = [...filterParams, listLimit];
+    const [rows] = await db.execute(
+      `SELECT vl.id, vl.void_type AS voidType, vl.order_id AS orderId, vl.order_item_id AS orderItemId,
+              vl.product_id AS productId, vl.product_sku AS productSku, vl.product_name AS productName,
+              vl.quantity, vl.unit_price AS unitPrice, vl.amount,
+              vl.table_id AS tableId, vl.session_id AS sessionId,
+              vl.voided_by AS voidedBy, vl.voided_by_name AS voidedByName,
+              vl.voided_by_employee_id AS voidedByEmployeeId,
+              vl.voided_at AS voidedAt, vl.reason,
+              t.name AS tableName, t.area AS tableArea
+       FROM void_log vl
+       LEFT JOIN pos_tables t ON t.branch_id = vl.branch_id AND t.id = vl.table_id
+       ${filterSql}
+       ORDER BY vl.voided_at DESC, vl.id DESC
+       LIMIT ?`,
+      listParams
+    );
     const list = (rows || []).map((r) => {
       const voidedAt = r.voidedAt ? new Date(r.voidedAt) : null;
       return {
@@ -4912,15 +5261,23 @@ app.get("/api/reports/voids", requireAnyPermission("approve_voids", "view_audit_
         reason: r.reason || "—",
       };
     });
-    const summary = {
-      totalVoids: list.length,
-      totalQuantity: list.reduce((s, r) => s + r.quantity, 0),
-      totalAmount: Math.round(list.reduce((s, r) => s + r.amount, 0) * 100) / 100,
-    };
-    res.json({ list, summary });
+    res.json({
+      list,
+      summary: {
+        totalVoids,
+        totalQuantity,
+        totalAmount,
+        listed: list.length,
+        truncated: totalVoids > list.length,
+        limit: listLimit,
+      },
+    });
   } catch (err) {
     if (err.code === "ER_NO_SUCH_TABLE") {
-      return res.json({ list: [], summary: { totalVoids: 0, totalQuantity: 0, totalAmount: 0 } });
+      return res.json({
+        list: [],
+        summary: { totalVoids: 0, totalQuantity: 0, totalAmount: 0, listed: 0, truncated: false, limit: listLimit },
+      });
     }
     console.error("Void report error:", err);
     res.status(500).json({ error: "Failed to load void report" });
@@ -4930,18 +5287,20 @@ app.get("/api/reports/voids", requireAnyPermission("approve_voids", "view_audit_
 app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_payroll", "view_reports"), async (req, res) => {
   const branchId = getBranchId(req);
   const { from, to, dayStartHour } = req.query;
-  const fromDate = from || new Date().toISOString().slice(0, 10);
+  const fromDate = from || localDateString();
   const toDate = to || fromDate;
   const startHour =
     dayStartHour != null
       ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
       : null;
-  const hourPad = startHour != null ? String(startHour).padStart(2, "0") : null;
-  const dateClause =
-    startHour != null
-      ? `o.created_at >= CONCAT(?, ' ', ?, ':00:00') AND o.created_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00')`
-      : `o.order_date BETWEEN ? AND ?`;
-  const dateParams = startHour != null ? [fromDate, hourPad, toDate, hourPad] : [fromDate, toDate];
+  const { sql: dateSqlRaw, params: dateParams } = buildRevenueDayFilter({
+    startHour,
+    fromDate,
+    toDate,
+    noSessionTsCol: "o.created_at",
+    noSessionDateCol: "o.order_date",
+  });
+  const dateClause = dateSqlRaw.replace(/^\s*AND\s*/, "");
   try {
     const db = await getPool();
     const [rows] = await db.execute(
@@ -4960,47 +5319,51 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
       if (!v) return null;
       try { return Array.isArray(typeof v === "string" ? JSON.parse(v) : v) ? (typeof v === "string" ? JSON.parse(v) : v) : null; } catch (_) { return null; }
     };
-    // Get LD drink count (quantity) AND total sales amount per staff for this period
-    // Attribute LD lines to staff: served_by when set, else order opener (pending tabs often omit served_by)
+    // Attribute by served_by (users.id) or, when unset, order opener employee_id (string code).
     const ldCountRows = await queryWithVoidFallback(
       db,
-      `SELECT COALESCE(oi.served_by, o.employee_id) AS userId,
+      `SELECT oi.served_by AS servedBy, o.employee_id AS employeeId,
               SUM(oi.quantity) AS ldCount,
               SUM(oi.subtotal) AS ldAmount
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status = 'paid'
          AND COALESCE(oi.is_voided,0) = 0
-       GROUP BY COALESCE(oi.served_by, o.employee_id)`,
-      `SELECT COALESCE(oi.served_by, o.employee_id) AS userId,
+         AND ${PAYROLL_LD_NON_COMP_SQL}
+       GROUP BY oi.served_by, o.employee_id`,
+      `SELECT oi.served_by AS servedBy, o.employee_id AS employeeId,
               SUM(oi.quantity) AS ldCount,
               SUM(oi.subtotal) AS ldAmount
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status = 'paid'
-       GROUP BY COALESCE(oi.served_by, o.employee_id)`,
+       GROUP BY oi.served_by, o.employee_id`,
       [branchId, ...dateParams]
     );
-    // Includes open (pending) orders — same attribution as paid
     const ldCountRealtimeRows = await queryWithVoidFallback(
       db,
-      `SELECT COALESCE(oi.served_by, o.employee_id) AS userId,
+      `SELECT oi.served_by AS servedBy, o.employee_id AS employeeId,
               SUM(oi.quantity) AS ldCountRealtime
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status IN ('pending','paid')
          AND COALESCE(oi.is_voided,0) = 0
-       GROUP BY COALESCE(oi.served_by, o.employee_id)`,
-      `SELECT COALESCE(oi.served_by, o.employee_id) AS userId,
+         AND ${PAYROLL_LD_NON_COMP_SQL}
+       GROUP BY oi.served_by, o.employee_id`,
+      `SELECT oi.served_by AS servedBy, o.employee_id AS employeeId,
               SUM(oi.quantity) AS ldCountRealtime
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status IN ('pending','paid')
-       GROUP BY COALESCE(oi.served_by, o.employee_id)`,
+       GROUP BY oi.served_by, o.employee_id`,
       [branchId, ...dateParams]
     );
     // Branch-wide qty (every LD line, including unassigned served_by/employee)
@@ -5010,13 +5373,16 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
               COALESCE(SUM(oi.quantity), 0) AS totalLdQtyRealtime
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status IN ('pending','paid')
-         AND COALESCE(oi.is_voided,0) = 0`,
+         AND COALESCE(oi.is_voided,0) = 0
+         AND ${PAYROLL_LD_NON_COMP_SQL}`,
       `SELECT COALESCE(SUM(CASE WHEN o.status = 'paid' THEN oi.quantity ELSE 0 END), 0) AS totalLdQtyPaid,
               COALESCE(SUM(oi.quantity), 0) AS totalLdQtyRealtime
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status IN ('pending','paid')`,
       [branchId, ...dateParams]
@@ -5024,20 +5390,39 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
     const ldCountMap = {};
     const ldAmountMap = {};
     const ldCountRealtimeMap = {};
+    const ldCountByEmp = {};
+    const ldAmountByEmp = {};
+    const ldCountRealtimeByEmp = {};
     const pickNum = (row, camel, snake) => Number(row?.[camel] ?? row?.[snake] ?? 0);
-    for (const r of (ldCountRows || [])) {
-      const uid = r.userId ?? r.user_id;
-      if (uid != null && uid !== "") {
-        ldCountMap[String(uid)] = pickNum(r, "ldCount", "ldcount");
-        ldAmountMap[String(uid)] = pickNum(r, "ldAmount", "ldamount");
+    const addLdMaps = (rowsIn, mode) => {
+      for (const r of rowsIn || []) {
+        const servedBy = r.servedBy ?? r.served_by;
+        const empId = r.employeeId ?? r.employee_id;
+        const qty = mode === "paid"
+          ? pickNum(r, "ldCount", "ldcount")
+          : pickNum(r, "ldCountRealtime", "ldcountrealtime");
+        const amt = mode === "paid" ? pickNum(r, "ldAmount", "ldamount") : 0;
+        if (servedBy != null && servedBy !== "") {
+          const key = String(servedBy);
+          if (mode === "paid") {
+            ldCountMap[key] = (ldCountMap[key] || 0) + qty;
+            ldAmountMap[key] = (ldAmountMap[key] || 0) + amt;
+          } else {
+            ldCountRealtimeMap[key] = (ldCountRealtimeMap[key] || 0) + qty;
+          }
+        } else if (empId != null && empId !== "") {
+          const key = String(empId);
+          if (mode === "paid") {
+            ldCountByEmp[key] = (ldCountByEmp[key] || 0) + qty;
+            ldAmountByEmp[key] = (ldAmountByEmp[key] || 0) + amt;
+          } else {
+            ldCountRealtimeByEmp[key] = (ldCountRealtimeByEmp[key] || 0) + qty;
+          }
+        }
       }
-    }
-    for (const r of (ldCountRealtimeRows || [])) {
-      const uid = r.userId ?? r.user_id;
-      if (uid != null && uid !== "") {
-        ldCountRealtimeMap[String(uid)] = pickNum(r, "ldCountRealtime", "ldcountrealtime");
-      }
-    }
+    };
+    addLdMaps(ldCountRows, "paid");
+    addLdMaps(ldCountRealtimeRows, "realtime");
     const agg0 = (ldQtyAggRows && ldQtyAggRows[0]) || {};
     const totalLdQtyPaid = pickNum(agg0, "totalLdQtyPaid", "totalldqtypaid");
     const totalLdQtyRealtime = pickNum(agg0, "totalLdQtyRealtime", "totalldqtyrealtime");
@@ -5078,9 +5463,9 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
         allowance: budget,
         hours: 0,
         commission,
-        ldCount: ldCountMap[String(r.userId)] ?? 0,
-        ldCountRealtime: ldCountRealtimeMap[String(r.userId)] ?? 0,
-        ldAmount: ldAmountMap[String(r.userId)] ?? 0,
+        ldCount: ldCountMap[String(r.userId)] ?? ldCountByEmp[String(r.employeeId)] ?? 0,
+        ldCountRealtime: ldCountRealtimeMap[String(r.userId)] ?? ldCountRealtimeByEmp[String(r.employeeId)] ?? 0,
+        ldAmount: ldAmountMap[String(r.userId)] ?? ldAmountByEmp[String(r.employeeId)] ?? 0,
         incentives,
         adjustments,
         deductions,
@@ -5301,24 +5686,29 @@ app.get("/api/reports/payroll/:id/ld-by-table", requireAnyPermission("view_payro
       dayStartHour != null
         ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
         : null;
-    const hourPad = startHour != null ? String(startHour).padStart(2, "0") : null;
-    const dateClause =
-      startHour != null
-        ? `o.created_at >= CONCAT(?, ' ', ?, ':00:00') AND o.created_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00')`
-        : `o.order_date BETWEEN ? AND ?`;
-    const dateParams = startHour != null ? [fromDate, hourPad, toDate, hourPad] : [fromDate, toDate];
+    const { sql: dateSqlRaw, params: dateParams } = buildRevenueDayFilter({
+      startHour,
+      fromDate,
+      toDate,
+      noSessionTsCol: "o.created_at",
+      noSessionDateCol: "o.order_date",
+    });
+    const dateClause = dateSqlRaw.replace(/^\s*AND\s*/, "");
 
     const totalLdRows = await queryWithVoidFallback(
       db,
       `SELECT COALESCE(SUM(oi.quantity),0) AS totalLd
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
-         AND COALESCE(oi.is_voided,0) = 0`,
+         AND COALESCE(oi.is_voided,0) = 0
+         AND ${PAYROLL_LD_NON_COMP_SQL}`,
       `SELECT COALESCE(SUM(oi.quantity),0) AS totalLd
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}`,
       [branchId, ...dateParams]
@@ -5346,11 +5736,12 @@ app.get("/api/reports/payroll/:id/ld-by-table", requireAnyPermission("view_payro
 
 // Compute payouts for all staff (creates/updates payout records; scoped by branch)
 // Commission = staff commission_rate × this staff's LD count (paid + open/pending)
-// Incentive = incentive_rate × branch-wide total LD count (kabuuan, paid + open/pending)
+// Incentive = incentive_rate × branch-wide total LD count (kabuuan) + table_incentive × distinct tables
+// Quota (optional): if has_quota and LD sales amount < quota_amount, commission/incentives/table pay = 0
 app.post("/api/reports/payroll/compute", requireAnyPermission("manage_payroll", "compute_daily_payouts"), async (req, res) => {
   const branchId = getBranchId(req);
   const { from, to, dayStartHour } = req.body || {};
-  const fromDate = from || new Date().toISOString().slice(0, 10);
+  const fromDate = from || localDateString();
   const toDate = to || fromDate;
   
   try {
@@ -5373,7 +5764,7 @@ app.post("/api/attendance/clock-in", requireAnyPermission("access_attendance"), 
   if (!userId) return res.status(401).json({ error: "Not authenticated" });
   try {
     const db = await getPool();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const now = new Date();
     await db.execute(
       `INSERT INTO attendance (user_id, work_date, time_in, break_minutes) VALUES (?, ?, ?, 0)
@@ -5407,7 +5798,7 @@ app.post("/api/attendance/clock-out", requireAnyPermission("access_attendance"),
   if (!userId) return res.status(401).json({ error: "Not authenticated" });
   try {
     const db = await getPool();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const now = new Date();
     const [result] = await db.execute(
       `UPDATE attendance SET time_out = ?, updated_at = NOW() WHERE user_id = ? AND work_date = ?`,
@@ -5443,7 +5834,7 @@ app.get("/api/attendance/today", requireAnyPermission("access_attendance"), asyn
   if (!userId) return res.status(401).json({ error: "Not authenticated" });
   try {
     const db = await getPool();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const [rows] = await db.execute(
       `SELECT id, user_id AS userId, work_date AS workDate, time_in AS timeIn, time_out AS timeOut, break_minutes AS breakMinutes
        FROM attendance WHERE user_id = ? AND work_date = ?`,
@@ -5469,7 +5860,7 @@ app.get("/api/attendance/today", requireAnyPermission("access_attendance"), asyn
 // List attendance for period (own records unless manage_staff)
 app.get("/api/attendance", requireAnyPermission("access_attendance", "manage_staff", "view_payroll"), async (req, res) => {
   const { from, to } = req.query;
-  const fromDate = from || new Date().toISOString().slice(0, 10);
+  const fromDate = from || localDateString();
   const toDate = to || fromDate;
   const canViewAll = req.authUser?.permissions?.includes("manage_staff") || req.authUser?.permissions?.includes("view_payroll");
   const userId = canViewAll && req.query.userId ? req.query.userId : req.authUser?.id;
@@ -5547,7 +5938,7 @@ app.post("/api/shifts/open", requireAnyPermission("close_shift"), async (req, re
     const now = new Date();
     const [result] = await db.execute(
       `INSERT INTO shifts (user_id, branch_id, shift_date, start_time, opening_cash, status) VALUES (?, ?, ?, ?, ?, 'open')`,
-      [userId, branchId, now.toISOString().split('T')[0], now, openingCash || 0]
+      [userId, branchId, localDateString(now), now, openingCash || 0]
     );
     
     const [newShift] = await db.execute(`SELECT * FROM shifts WHERE id = ?`, [result.insertId]);
@@ -5569,16 +5960,8 @@ app.get("/api/shifts/:id/summary", requireAnyPermission("close_shift", "view_shi
     if (!shift[0]) return res.status(404).json({ error: "Shift not found" });
     
     // Get sales totals since shift started (same branch as shift)
-    const [salesData] = await db.execute(`
-      SELECT 
-        COALESCE(SUM(CASE WHEN ${SALES_CASH_COND} THEN total ELSE 0 END), 0) as cash_sales,
-        COALESCE(SUM(CASE WHEN ${SALES_CARD_COND} THEN total ELSE 0 END), 0) as card_sales,
-        COALESCE(SUM(CASE WHEN ${SALES_GCASH_COND} THEN total ELSE 0 END), 0) as gcash_sales,
-        COALESCE(SUM(CASE WHEN ${SALES_BANK_COND} THEN total ELSE 0 END), 0) as bank_sales,
-        COUNT(*) as transaction_count
-      FROM orders 
-      WHERE branch_id = ? AND status = 'paid' AND created_at >= ?
-    `, [shift[0].branch_id, shift[0].start_time]);
+    const tenders = await getShiftTenderSales(db, shift[0].branch_id, shift[0].start_time);
+    const collections = await getShiftChargeCollections(db, shift[0].branch_id, shift[0].start_time);
     
     // Get refunds total
     const [refundData] = await db.execute(`
@@ -5594,8 +5977,15 @@ app.get("/api/shifts/:id/summary", requireAnyPermission("close_shift", "view_shi
       WHERE shift_id = ? AND status = 'completed'
     `, [shiftId]);
     
-    const sales = salesData[0];
-    const expectedCash = Number(shift[0].opening_cash) + Number(sales.cash_sales) - Number(refundData[0].total_refunds);
+    // Charge sales stay in AR; cash collected when utang is marked paid goes into the drawer.
+    // Digital→cash conversions (pasahod) also increase physical cash in drawer.
+    const conversionCash = await sumShiftCashConversions(db, shiftId);
+    const expectedCash =
+      Number(shift[0].opening_cash) +
+      Number(tenders.cash) +
+      Number(collections.cash) +
+      Number(conversionCash) -
+      Number(refundData[0].total_refunds);
     let conversions = [];
     try {
       const [convRows] = await db.execute("SELECT from_method, to_method, amount, notes, converted_by, converted_at FROM payment_conversions WHERE shift_id = ? ORDER BY converted_at DESC", [shiftId]);
@@ -5604,13 +5994,17 @@ app.get("/api/shifts/:id/summary", requireAnyPermission("close_shift", "view_shi
     res.json({
       shift: shift[0],
       sales: {
-        cash: Number(sales.cash_sales),
-        card: Number(sales.card_sales),
-        gcash: Number(sales.gcash_sales),
-        bank: Number(sales.bank_sales),
-        total: Number(sales.cash_sales) + Number(sales.card_sales) + Number(sales.gcash_sales) + Number(sales.bank_sales),
-        transactionCount: Number(sales.transaction_count),
+        cash: tenders.cash,
+        card: tenders.card,
+        gcash: tenders.gcash,
+        bank: tenders.bank,
+        charge: tenders.charge,
+        total: tenders.total,
+        tenderTotal: tenders.tenderTotal,
+        transactionCount: tenders.transactionCount,
       },
+      chargeCollections: collections,
+      conversionCash,
       refunds: Number(refundData[0].total_refunds),
       voids: Number(voidData[0].total_voids),
       conversions,
@@ -5639,16 +6033,10 @@ app.post("/api/shifts/:id/close", requireAnyPermission("close_shift"), async (re
       return res.status(403).json({ error: "You can only close your own shift" });
     }
     
-    // Calculate totals
-    const [salesData] = await db.execute(`
-      SELECT 
-        COALESCE(SUM(CASE WHEN ${SALES_CASH_COND} THEN total ELSE 0 END), 0) as cash_sales,
-        COALESCE(SUM(CASE WHEN ${SALES_CARD_COND} THEN total ELSE 0 END), 0) as card_sales,
-        COALESCE(SUM(CASE WHEN ${SALES_GCASH_COND} THEN total ELSE 0 END), 0) as gcash_sales,
-        COALESCE(SUM(CASE WHEN ${SALES_BANK_COND} THEN total ELSE 0 END), 0) as bank_sales
-      FROM orders 
-      WHERE status = 'paid' AND created_at >= ?
-    `, [shift[0].start_time]);
+    // Calculate totals (branch-scoped; splits allocated by tender; charge tracked separately)
+    const tenders = await getShiftTenderSales(db, shift[0].branch_id, shift[0].start_time);
+    const collections = await getShiftChargeCollections(db, shift[0].branch_id, shift[0].start_time);
+    const conversionCash = await sumShiftCashConversions(db, shiftId);
     
     const [refundData] = await db.execute(`
       SELECT COALESCE(SUM(refund_amount), 0) as total FROM refunds WHERE shift_id = ? AND status = 'completed'
@@ -5658,8 +6046,12 @@ app.post("/api/shifts/:id/close", requireAnyPermission("close_shift"), async (re
       SELECT COALESCE(SUM(voided_amount), 0) as total FROM payment_voids WHERE shift_id = ? AND status = 'completed'
     `, [shiftId]);
     
-    const sales = salesData[0];
-    const expectedCash = Number(shift[0].opening_cash) + Number(sales.cash_sales) - Number(refundData[0].total);
+    const expectedCash =
+      Number(shift[0].opening_cash) +
+      Number(tenders.cash) +
+      Number(collections.cash) +
+      Number(conversionCash) -
+      Number(refundData[0].total);
     const variance = actualCash - expectedCash;
     
     // Update shift
@@ -5680,7 +6072,7 @@ app.post("/api/shifts/:id/close", requireAnyPermission("close_shift"), async (re
         notes = ?
       WHERE id = ?
     `, [
-      sales.cash_sales, sales.card_sales, sales.gcash_sales, sales.bank_sales,
+      tenders.cash, tenders.card, tenders.gcash, tenders.bank,
       refundData[0].total, voidData[0].total,
       expectedCash, actualCash, variance, varianceReason || null, notes || null, shiftId
     ]);
@@ -5768,9 +6160,12 @@ app.get("/api/charges", requireAnyPermission("manage_settings", "accept_payments
       sql += " AND customer_name LIKE ?";
       params.push("%" + String(customerName).trim() + "%");
     }
-    if (status && ["pending", "paid"].includes(String(status))) {
+    if (status && ["pending", "paid", "cancelled"].includes(String(status))) {
       sql += " AND status = ?";
       params.push(status);
+    } else if (!status) {
+      // Default list hides cancelled AR created by payment voids
+      sql += " AND status <> 'cancelled'";
     }
     if (from) { sql += " AND charged_at >= ?"; params.push(from); }
     if (to) { sql += " AND charged_at <= ?"; params.push(to + " 23:59:59"); }
@@ -5783,6 +6178,8 @@ app.get("/api/charges", requireAnyPermission("manage_settings", "accept_payments
       customerName: r.customer_name,
       amount: Number(r.amount),
       status: r.status,
+      collectionMethod: r.collection_method || null,
+      shiftId: r.shift_id != null ? Number(r.shift_id) : null,
       chargedAt: r.charged_at?.toISOString?.() || r.charged_at,
       paidAt: r.paid_at?.toISOString?.() || r.paid_at,
       chargedBy: r.charged_by,
@@ -5799,19 +6196,53 @@ app.get("/api/charges", requireAnyPermission("manage_settings", "accept_payments
 app.patch("/api/charges/:id/mark-paid", requireAnyPermission("manage_settings", "accept_payments"), async (req, res) => {
   const id = req.params.id;
   const branchId = getBranchId(req);
-  const { paidBy } = req.body || {};
+  const { paidBy, paymentMethod, shiftId } = req.body || {};
   const { userName, employeeId } = getActingUser(req);
   try {
     const db = await getPool();
     const [rows] = await db.execute("SELECT id, status FROM charge_transactions WHERE id = ? AND branch_id = ?", [id, branchId]);
     if (!rows.length) return res.status(404).json({ error: "Charge not found" });
     if (rows[0].status === "paid") return res.status(400).json({ error: "Charge is already paid" });
-    await db.execute(
-      "UPDATE charge_transactions SET status = 'paid', paid_at = NOW(), paid_by = ? WHERE id = ? AND branch_id = ?",
-      [paidBy || userName || employeeId || null, id, branchId]
-    );
-    logAudit(req, "charge_mark_paid", "charge", id, { paidBy: paidBy || userName || employeeId });
-    res.json({ ok: true });
+
+    // Collection method for drawer (not the original charge sale). Default cash.
+    let collectionMethod = "cash";
+    if (paymentMethod != null && String(paymentMethod).trim() !== "") {
+      const m = normalizePaymentMethod(paymentMethod);
+      if (m === "charge") return res.status(400).json({ error: "Collection method cannot be charge" });
+      collectionMethod = m;
+    }
+
+    let resolvedShiftId = shiftId != null && Number.isFinite(Number(shiftId)) ? Number(shiftId) : null;
+    if (!resolvedShiftId) {
+      try {
+        const [openShift] = await db.execute(
+          `SELECT id FROM shifts WHERE branch_id = ? AND status = 'open' ORDER BY start_time DESC LIMIT 1`,
+          [branchId]
+        );
+        if (openShift[0]) resolvedShiftId = Number(openShift[0].id);
+      } catch (_) {}
+    }
+
+    try {
+      await db.execute(
+        `UPDATE charge_transactions
+         SET status = 'paid', paid_at = NOW(), paid_by = ?, collection_method = ?, shift_id = ?
+         WHERE id = ? AND branch_id = ?`,
+        [paidBy || userName || employeeId || null, collectionMethod, resolvedShiftId, id, branchId]
+      );
+    } catch (e) {
+      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+      await db.execute(
+        "UPDATE charge_transactions SET status = 'paid', paid_at = NOW(), paid_by = ? WHERE id = ? AND branch_id = ?",
+        [paidBy || userName || employeeId || null, id, branchId]
+      );
+    }
+    logAudit(req, "charge_mark_paid", "charge", id, {
+      paidBy: paidBy || userName || employeeId,
+      collectionMethod,
+      shiftId: resolvedShiftId,
+    });
+    res.json({ ok: true, collectionMethod, shiftId: resolvedShiftId });
   } catch (err) {
     console.error("Mark charge paid error:", err);
     res.status(500).json({ error: "Failed to mark as paid" });
@@ -5887,13 +6318,37 @@ app.get("/api/conversions", requireAnyPermission("close_shift", "view_shift_summ
 app.post("/api/refunds", requireAnyPermission("refund_payments"), async (req, res) => {
   try {
     const db = await getPool();
-    const { orderId, originalPaymentMethod, refundAmount, refundMethod, reason, requestedBy, shiftId } = req.body;
-    
+    const branchId = getBranchId(req);
+    const { orderId, originalPaymentMethod, refundAmount, refundMethod, reason, requestedBy, shiftId } = req.body || {};
+    if (!orderId) return res.status(400).json({ error: "orderId is required" });
+
+    const [orders] = await db.execute(`SELECT id, branch_id, status FROM orders WHERE id = ?`, [orderId]);
+    if (!orders.length) return res.status(404).json({ error: "Order not found" });
+    if (String(orders[0].branch_id) !== String(branchId)) {
+      return res.status(403).json({ error: "Order belongs to another branch" });
+    }
+
+    const acting = getActingUser(req);
+    const requesterId = requestedBy != null && Number.isFinite(Number(requestedBy))
+      ? Number(requestedBy)
+      : acting.userId != null
+        ? Number(acting.userId)
+        : null;
+    if (!requesterId) return res.status(400).json({ error: "requestedBy is required" });
+
     const [result] = await db.execute(`
       INSERT INTO refunds (order_id, original_payment_method, refund_amount, refund_method, reason, requested_by, shift_id, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-    `, [orderId, originalPaymentMethod, refundAmount, refundMethod, reason, requestedBy, shiftId || null]);
-    
+    `, [
+      orderId,
+      originalPaymentMethod || null,
+      Number(refundAmount) || 0,
+      refundMethod || "cash",
+      String(reason || "").trim() || "Refund",
+      requesterId,
+      shiftId || null,
+    ]);
+
     const [newRefund] = await db.execute(`SELECT * FROM refunds WHERE id = ?`, [result.insertId]);
     res.json(newRefund[0]);
   } catch (err) {
@@ -5906,23 +6361,48 @@ app.post("/api/refunds", requireAnyPermission("refund_payments"), async (req, re
 app.put("/api/refunds/:id", requireAnyPermission("refund_payments"), async (req, res) => {
   try {
     const db = await getPool();
+    const branchId = getBranchId(req);
     const refundId = req.params.id;
-    const { status, approvedBy } = req.body;
-    
-    let sql = `UPDATE refunds SET status = ?`;
-    const params = [status];
-    
-    if (status === 'approved' || status === 'completed') {
-      sql += `, approved_by = ?`;
-      params.push(approvedBy);
+    const { status, approvedBy } = req.body || {};
+    const nextStatus = String(status || "").toLowerCase();
+    if (!["pending", "approved", "completed", "rejected"].includes(nextStatus)) {
+      return res.status(400).json({ error: "Invalid status" });
     }
-    if (status === 'completed') {
+
+    const [rows] = await db.execute(
+      `SELECT r.*, o.branch_id AS orderBranchId
+       FROM refunds r
+       JOIN orders o ON o.id = r.order_id
+       WHERE r.id = ?`,
+      [refundId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Refund not found" });
+    if (String(rows[0].orderBranchId) !== String(branchId)) {
+      return res.status(403).json({ error: "Refund belongs to another branch" });
+    }
+    if (String(rows[0].status) === "completed") {
+      return res.status(400).json({ error: "Refund already completed" });
+    }
+
+    const acting = getActingUser(req);
+    const approverId = approvedBy != null && Number.isFinite(Number(approvedBy))
+      ? Number(approvedBy)
+      : acting.userId != null
+        ? Number(acting.userId)
+        : null;
+
+    let sql = `UPDATE refunds SET status = ?`;
+    const params = [nextStatus];
+    if (nextStatus === "approved" || nextStatus === "completed" || nextStatus === "rejected") {
+      sql += `, approved_by = ?`;
+      params.push(approverId);
+    }
+    if (nextStatus === "completed") {
       sql += `, completed_at = NOW()`;
     }
-    
     sql += ` WHERE id = ?`;
     params.push(refundId);
-    
+
     await db.execute(sql, params);
     const [updated] = await db.execute(`SELECT * FROM refunds WHERE id = ?`, [refundId]);
     res.json(updated[0]);
@@ -5936,21 +6416,22 @@ app.put("/api/refunds/:id", requireAnyPermission("refund_payments"), async (req,
 app.get("/api/refunds", requireAnyPermission("refund_payments", "view_payments", "view_reports"), async (req, res) => {
   try {
     const db = await getPool();
+    const branchId = getBranchId(req);
     const { orderId, status, dateFrom, dateTo } = req.query;
-    
-    let sql = `SELECT r.*, o.table_id, u.name as requested_by_name 
-               FROM refunds r 
-               LEFT JOIN orders o ON r.order_id = o.id 
+
+    let sql = `SELECT r.*, o.table_id, u.name as requested_by_name
+               FROM refunds r
+               INNER JOIN orders o ON r.order_id = o.id AND o.branch_id = ?
                LEFT JOIN users u ON r.requested_by = u.id
                WHERE 1=1`;
-    const params = [];
-    
+    const params = [branchId];
+
     if (orderId) { sql += ` AND r.order_id = ?`; params.push(orderId); }
     if (status) { sql += ` AND r.status = ?`; params.push(status); }
     if (dateFrom) { sql += ` AND DATE(r.created_at) >= ?`; params.push(dateFrom); }
     if (dateTo) { sql += ` AND DATE(r.created_at) <= ?`; params.push(dateTo); }
-    
-    sql += ` ORDER BY r.created_at DESC`;
+
+    sql += ` ORDER BY r.created_at DESC LIMIT 2000`;
     const [rows] = await db.execute(sql, params);
     res.json(rows);
   } catch (err) {
@@ -5967,13 +6448,45 @@ app.get("/api/refunds", requireAnyPermission("refund_payments", "view_payments",
 app.post("/api/payment-voids", requireAnyPermission("void_payments"), async (req, res) => {
   try {
     const db = await getPool();
-    const { orderId, paymentMethod, voidedAmount, reason, requestedBy, shiftId } = req.body;
-    
+    const branchId = getBranchId(req);
+    const { orderId, paymentMethod, voidedAmount, reason, requestedBy, shiftId } = req.body || {};
+
+    if (!orderId) return res.status(400).json({ error: "orderId is required" });
+    let reasonText;
+    try {
+      reasonText = normalizeVoidReason(reason);
+    } catch (reasonErr) {
+      return res.status(400).json({ error: reasonErr.message });
+    }
+
+    const [orders] = await db.execute(
+      `SELECT id, branch_id, status, payment_method, total FROM orders WHERE id = ?`,
+      [orderId]
+    );
+    if (!orders.length) return res.status(404).json({ error: "Order not found" });
+    if (String(orders[0].branch_id) !== String(branchId)) {
+      return res.status(403).json({ error: "Order belongs to another branch" });
+    }
+    if (String(orders[0].status) !== "paid") {
+      return res.status(400).json({ error: "Only paid orders can have a payment void" });
+    }
+
+    const acting = getActingUser(req);
+    const requesterId = requestedBy != null && Number.isFinite(Number(requestedBy))
+      ? Number(requestedBy)
+      : acting.userId != null
+        ? Number(acting.userId)
+        : null;
+    if (!requesterId) return res.status(400).json({ error: "requestedBy is required" });
+
+    const method = paymentMethod || orders[0].payment_method || "cash";
+    const amount = voidedAmount != null ? Number(voidedAmount) : Number(orders[0].total || 0);
+
     const [result] = await db.execute(`
       INSERT INTO payment_voids (order_id, payment_method, voided_amount, reason, requested_by, shift_id, status)
       VALUES (?, ?, ?, ?, ?, ?, 'pending')
-    `, [orderId, paymentMethod, voidedAmount, reason, requestedBy, shiftId || null]);
-    
+    `, [orderId, method, amount, reasonText, requesterId, shiftId || null]);
+
     const [newVoid] = await db.execute(`SELECT * FROM payment_voids WHERE id = ?`, [result.insertId]);
     res.json(newVoid[0]);
   } catch (err) {
@@ -5982,38 +6495,171 @@ app.post("/api/payment-voids", requireAnyPermission("void_payments"), async (req
   }
 });
 
-// Approve/Complete payment void
+// Approve/Complete payment void — restores stock, clears payment, audits void_log
 app.put("/api/payment-voids/:id", requireAnyPermission("void_payments"), async (req, res) => {
+  let conn;
   try {
     const db = await getPool();
+    const branchId = getBranchId(req);
     const voidId = req.params.id;
-    const { status, approvedBy } = req.body;
-    
-    let sql = `UPDATE payment_voids SET status = ?`;
-    const params = [status];
-    
-    if (status === 'approved' || status === 'completed') {
-      sql += `, approved_by = ?`;
-      params.push(approvedBy);
+    const { status, approvedBy } = req.body || {};
+    const nextStatus = String(status || "").toLowerCase();
+    if (!["pending", "approved", "completed", "rejected"].includes(nextStatus)) {
+      return res.status(400).json({ error: "Invalid status" });
     }
-    if (status === 'completed') {
-      sql += `, completed_at = NOW()`;
-      // Also update the order status back to pending if voiding
-      const [voidInfo] = await db.execute(`SELECT order_id FROM payment_voids WHERE id = ?`, [voidId]);
-      if (voidInfo[0]) {
-        await db.execute(`UPDATE orders SET status = 'pending' WHERE id = ?`, [voidInfo[0].order_id]);
+
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [voidRows] = await conn.execute(
+      `SELECT * FROM payment_voids WHERE id = ? FOR UPDATE`,
+      [voidId]
+    );
+    if (!voidRows.length) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Payment void not found" });
+    }
+    const pv = voidRows[0];
+    const [orderRows] = await conn.execute(
+      `SELECT id, branch_id AS orderBranchId, status AS orderStatus, table_id AS tableId,
+              payment_method AS orderPaymentMethod, total AS orderTotal
+       FROM orders WHERE id = ? FOR UPDATE`,
+      [pv.order_id]
+    );
+    if (!orderRows.length) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Order not found" });
+    }
+    Object.assign(pv, orderRows[0]);
+    if (String(pv.orderBranchId) !== String(branchId)) {
+      await conn.rollback();
+      return res.status(403).json({ error: "Payment void belongs to another branch" });
+    }
+    if (String(pv.status) === "completed") {
+      await conn.rollback();
+      return res.status(400).json({ error: "Payment void already completed" });
+    }
+
+    const acting = getActingUser(req);
+    const approverId = approvedBy != null && Number.isFinite(Number(approvedBy))
+      ? Number(approvedBy)
+      : acting.userId != null
+        ? Number(acting.userId)
+        : null;
+
+    let manager = { id: approverId, name: acting.userName || acting.employeeId || "Manager" };
+    if (approverId) {
+      const [uRows] = await conn.execute(
+        `SELECT id, name, employee_id FROM users WHERE id = ? AND branch_id = ?`,
+        [approverId, branchId]
+      );
+      if (uRows.length) {
+        manager = { id: uRows[0].id, name: uRows[0].name || manager.name };
       }
     }
-    
-    sql += ` WHERE id = ?`;
-    params.push(voidId);
-    
-    await db.execute(sql, params);
+
+    if (nextStatus === "completed") {
+      if (String(pv.orderStatus) !== "paid") {
+        await conn.rollback();
+        return res.status(400).json({ error: "Order is no longer paid; cannot complete payment void" });
+      }
+
+      const orderId = pv.order_id;
+      const reasonText = pv.reason || "Payment void";
+
+      try {
+        await logPaymentVoidForOrder(conn, {
+          branchId,
+          orderId,
+          reason: reasonText,
+          manager,
+          employeeId: acting.employeeId || null,
+        });
+      } catch (logErr) {
+        if (logErr.code !== "ER_NO_SUCH_TABLE") throw logErr;
+      }
+
+      try {
+        await restoreStockForPaidOrderIds(conn, [orderId]);
+      } catch (stockErr) {
+        if (stockErr.code !== "ER_NO_SUCH_TABLE") throw stockErr;
+      }
+
+      await conn.execute(
+        `UPDATE orders SET status = 'pending', payment_method = NULL WHERE id = ? AND status = 'paid'`,
+        [orderId]
+      );
+
+      try {
+        await conn.execute(`DELETE FROM split_payments WHERE order_id = ?`, [orderId]);
+      } catch (e) {
+        if (e.code !== "ER_NO_SUCH_TABLE") throw e;
+      }
+
+      try {
+        await reconcileChargesAfterPaymentVoid(conn, branchId, orderId, pv.orderTotal || pv.voided_amount);
+      } catch (chargeErr) {
+        if (chargeErr.code !== "ER_NO_SUCH_TABLE") throw chargeErr;
+      }
+
+      // Recalculate pending totals (drop card surcharge baked into paid total)
+      try {
+        const settings = await loadPosFinancialSettings(conn);
+        await updateOrderTotalsFromItems(conn, orderId, settings);
+      } catch (_) {
+        // non-fatal — order is already pending
+      }
+
+      if (pv.tableId) {
+        try {
+          await conn.execute(
+            `UPDATE pos_tables SET status = 'occupied', current_order_id = ? WHERE branch_id = ? AND id = ?`,
+            [orderId, branchId, pv.tableId]
+          );
+          await ensureSessionForOrder(conn, {
+            branchId,
+            tableId: pv.tableId,
+            orderId,
+            waiterId: acting.employeeId || null,
+          });
+          await reconcileTableVisitIds(conn, branchId, pv.tableId);
+        } catch (e) {
+          if (e.code !== "ER_NO_SUCH_TABLE" && e.code !== "ER_BAD_FIELD_ERROR") throw e;
+        }
+      }
+
+      await conn.execute(
+        `UPDATE payment_voids SET status = 'completed', approved_by = COALESCE(?, approved_by), completed_at = NOW() WHERE id = ?`,
+        [approverId, voidId]
+      );
+      await logAudit(req, "payment_void_complete", "payment_void", voidId, {
+        orderId: String(orderId),
+        reason: reasonText,
+        voidedAmount: Number(pv.voided_amount),
+      });
+    } else {
+      let sql = `UPDATE payment_voids SET status = ?`;
+      const params = [nextStatus];
+      if (nextStatus === "approved" || nextStatus === "rejected") {
+        sql += `, approved_by = ?`;
+        params.push(approverId);
+      }
+      sql += ` WHERE id = ?`;
+      params.push(voidId);
+      await conn.execute(sql, params);
+    }
+
+    await conn.commit();
     const [updated] = await db.execute(`SELECT * FROM payment_voids WHERE id = ?`, [voidId]);
     res.json(updated[0]);
   } catch (err) {
+    if (conn) {
+      try { await conn.rollback(); } catch {}
+    }
     console.error("Update void error:", err);
-    res.status(500).json({ error: "Failed to update payment void" });
+    res.status(500).json({ error: err.message || "Failed to update payment void" });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
@@ -6119,26 +6765,91 @@ app.get("/api/split-payments/:orderId", requireAnyPermission("split_bill", "acce
 // TABLE TRANSFER / MERGE ENDPOINTS
 // ============================================================================
 
-// Transfer order(s) to another table. If transferAll: true, move ALL pending orders from fromTable to toTable.
+// Transfer order(s) to another table.
+// - Target empty: move (transferAll moves ALL pending from fromTable).
+// - Target occupied: swap all pending orders + sessions (bills stay separate). Use merge to combine bills.
 app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), async (req, res) => {
   const branchId = getBranchId(req);
   try {
     const db = await getPool();
     const { orderId, fromTable, toTable, reason, transferAll } = req.body;
     const transferredBy = req.authUser.id;
-    
-    const [targetOrders] = await db.execute(
-      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending'`,
+
+    if (!fromTable || !toTable) {
+      return res.status(400).json({ error: "fromTable and toTable are required" });
+    }
+    if (fromTable === toTable) {
+      return res.status(400).json({ error: "Source and target tables must be different" });
+    }
+
+    const [targetPending] = await db.execute(
+      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id`,
       [branchId, toTable]
     );
-    
-    if (targetOrders.length > 0) {
-      return res.status(400).json({ 
-        error: "Target table has active order. Use merge instead.",
-        existingOrderId: targetOrders[0].id 
+
+    // Occupied target → one-step swap (no temp table / punch-merge-void workaround)
+    if (targetPending.length > 0) {
+      const [sourcePending] = await db.execute(
+        `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id`,
+        [branchId, fromTable]
+      );
+      if (sourcePending.length === 0) {
+        return res.status(400).json({ error: "Source table has no active order to swap" });
+      }
+
+      const sourceIds = sourcePending.map((r) => r.id);
+      const targetIds = targetPending.map((r) => r.id);
+      const swapReason = reason?.trim() ? `swap: ${reason.trim()}` : "swap";
+
+      // Park source orders on a temp table_id so both sides can move without collision
+      const parkId = `__xfer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      for (const oid of sourceIds) {
+        await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [parkId, oid]);
+      }
+      for (const oid of targetIds) {
+        await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [fromTable, oid]);
+        await db.execute(`
+          INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason)
+          VALUES (?, ?, ?, 'move', ?, ?)
+        `, [oid, toTable, fromTable, transferredBy || null, swapReason]);
+      }
+      for (const oid of sourceIds) {
+        await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [toTable, oid]);
+        await db.execute(`
+          INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason)
+          VALUES (?, ?, ?, 'move', ?, ?)
+        `, [oid, fromTable, toTable, transferredBy || null, swapReason]);
+      }
+
+      try {
+        await swapOpenSessions(db, branchId, fromTable, toTable);
+      } catch (sessErr) {
+        if (sessErr.code !== "ER_NO_SUCH_TABLE") throw sessErr;
+      }
+
+      await db.execute(
+        `UPDATE pos_tables SET status = 'occupied', current_order_id = ? WHERE branch_id = ? AND id = ?`,
+        [String(targetIds[0]), branchId, fromTable]
+      );
+      await db.execute(
+        `UPDATE pos_tables SET status = 'occupied', current_order_id = ? WHERE branch_id = ? AND id = ?`,
+        [String(sourceIds[0]), branchId, toTable]
+      );
+
+      try {
+        await reconcileTableVisitIds(db, branchId, fromTable);
+        await reconcileTableVisitIds(db, branchId, toTable);
+      } catch (recErr) {
+        if (recErr.code !== "ER_NO_SUCH_TABLE" && recErr.code !== "ER_BAD_FIELD_ERROR") throw recErr;
+      }
+
+      return res.json({
+        ok: true,
+        action: "swap",
+        message: `Swapped tables ${fromTable} and ${toTable}`,
       });
     }
-    
+
     let orderIdsToMove = [];
     if (transferAll && fromTable && toTable) {
       const [sourceOrders] = await db.execute(
@@ -6149,11 +6860,11 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
     } else if (orderId && fromTable && toTable) {
       orderIdsToMove = [orderId];
     }
-    
+
     if (orderIdsToMove.length === 0) {
       return res.status(400).json({ error: "No orders to transfer" });
     }
-    
+
     for (const oid of orderIdsToMove) {
       await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [toTable, oid]);
       await db.execute(`
@@ -6161,7 +6872,7 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
         VALUES (?, ?, ?, 'move', ?, ?)
       `, [oid, fromTable, toTable, transferredBy || null, reason || null]);
     }
-    
+
     // Vacate source only when no pending orders remain there
     let remainingSource;
     try {
@@ -6230,7 +6941,7 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
     const msg = orderIdsToMove.length > 1
       ? `${orderIdsToMove.length} orders transferred from ${fromTable} to ${toTable}`
       : `Order transferred from ${fromTable} to ${toTable}`;
-    res.json({ ok: true, message: msg });
+    res.json({ ok: true, action: "move", message: msg });
   } catch (err) {
     console.error("Transfer table error:", err);
     res.status(500).json({ error: "Failed to transfer order" });
@@ -6397,8 +7108,19 @@ app.put("/api/settings", requireAnyPermission("manage_settings"), async (req, re
         PRIMARY KEY (branch_id, seq_date)
       )`,
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number VARCHAR(32) DEFAULT NULL",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_at TIMESTAMP NULL DEFAULT NULL",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_by INT UNSIGNED DEFAULT NULL",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_by_name VARCHAR(128) DEFAULT NULL",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS service_charge DECIMAL(12,2) NOT NULL DEFAULT 0",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS card_surcharge DECIMAL(12,2) NOT NULL DEFAULT 0",
+      // Older DBs only had ENUM('pending','paid') — voiding last item / full order writes 'voided'
+      // and MySQL returns "Data truncated for column 'status' at row 1" without this widen.
+      "ALTER TABLE orders MODIFY COLUMN status ENUM('pending','paid','voided','cancelled') NOT NULL DEFAULT 'pending'",
       // Long KTV sessions can accumulate many pending order IDs; VARCHAR(255) overflow broke Charge/Utang bill-out.
       "ALTER TABLE charge_transactions MODIFY COLUMN order_ids TEXT",
+      "ALTER TABLE charge_transactions ADD COLUMN IF NOT EXISTS collection_method VARCHAR(32) DEFAULT NULL",
+      "ALTER TABLE charge_transactions ADD COLUMN IF NOT EXISTS shift_id INT UNSIGNED DEFAULT NULL",
+      "ALTER TABLE charge_transactions MODIFY COLUMN status ENUM('pending','paid','cancelled') NOT NULL DEFAULT 'pending'",
       `CREATE TABLE IF NOT EXISTS receipt_snapshots (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         branch_id INT UNSIGNED NOT NULL DEFAULT 1,

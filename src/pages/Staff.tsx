@@ -43,7 +43,10 @@ export interface StaffMember {
   hourly: number;
   budget: number;
   commissionRate: number;   // Fixed ₱ commission on ladies drinks
-  incentiveRate: number;    // Fixed ₱ incentive amount
+  incentiveRate: number;    // Fixed ₱ incentive amount (× branch LD)
+  tableIncentive: number;   // ₱ per distinct table with LD
+  hasQuota: boolean;
+  quotaAmount: number;      // LD sales ₱ target to unlock commission/incentives
   hasLogin: boolean;
   status: "active" | "inactive";
 }
@@ -60,6 +63,9 @@ const emptyStaff = (): Omit<StaffMember, "id"> => ({
   budget: 0,
   commissionRate: 0,
   incentiveRate: 0,
+  tableIncentive: 0,
+  hasQuota: false,
+  quotaAmount: 0,
   hasLogin: false,
   status: "active",
 });
@@ -108,6 +114,9 @@ export default function Staff() {
         budget: s.budget,
         commissionRate: s.commissionRate,
         incentiveRate: s.incentiveRate,
+        tableIncentive: s.tableIncentive ?? 0,
+        hasQuota: !!s.hasQuota,
+        quotaAmount: s.quotaAmount ?? 0,
         hasLogin: s.hasLogin,
         status: s.status as "active" | "inactive",
       })));
@@ -168,6 +177,9 @@ export default function Staff() {
       budget: member.budget,
       commissionRate: member.commissionRate,
       incentiveRate: member.incentiveRate,
+      tableIncentive: member.tableIncentive ?? 0,
+      hasQuota: !!member.hasQuota,
+      quotaAmount: member.quotaAmount ?? 0,
       hasLogin: member.hasLogin,
       status: member.status,
     });
@@ -183,7 +195,7 @@ export default function Staff() {
     }
     setSaving(true);
     try {
-      await api.staff.create({ ...form, allowance: 0, hourly: 0, tableIncentive: 0, hasQuota: false, quotaAmount: 0, password: newPassword.trim() || "password" });
+      await api.staff.create({ ...form, allowance: 0, hourly: 0, password: newPassword.trim() || "password" });
       setAddOpen(false);
       setForm(emptyStaff());
       setNewPassword("password");
@@ -201,7 +213,7 @@ export default function Staff() {
     if (!editingStaff || !form.code.trim() || !form.name.trim()) return;
     setSaving(true);
     try {
-      const updated = await api.staff.update(editingStaff.id, { ...form, allowance: 0, hourly: 0, tableIncentive: 0, hasQuota: false, quotaAmount: 0 });
+      const updated = await api.staff.update(editingStaff.id, { ...form, allowance: 0, hourly: 0 });
       setEditOpen(false);
       setEditingStaff(null);
       setForm(emptyStaff());
@@ -335,7 +347,7 @@ export default function Staff() {
           />
         </div>
         <div className="space-y-2">
-          <Label htmlFor="incentiveRate">Incentive (₱)</Label>
+          <Label htmlFor="incentiveRate">Incentive (₱ × branch LD)</Label>
           <p className="text-xs text-muted-foreground">Multiplied by total LD (kabuuan) for the payroll period</p>
           <Input
             id="incentiveRate"
@@ -345,6 +357,43 @@ export default function Staff() {
             value={form.incentiveRate || ""}
             onChange={(e) => setForm((f) => ({ ...f, incentiveRate: Number(e.target.value) || 0 }))}
           />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="tableIncentive">Table incentive (₱)</Label>
+          <p className="text-xs text-muted-foreground">Per distinct table with this staff&apos;s LD</p>
+          <Input
+            id="tableIncentive"
+            type="number"
+            min={0}
+            step={0.01}
+            value={form.tableIncentive || ""}
+            onChange={(e) => setForm((f) => ({ ...f, tableIncentive: Number(e.target.value) || 0 }))}
+          />
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 pt-6">
+            <input
+              id="hasQuota"
+              type="checkbox"
+              className="h-4 w-4"
+              checked={form.hasQuota}
+              onChange={(e) => setForm((f) => ({ ...f, hasQuota: e.target.checked }))}
+            />
+            <Label htmlFor="hasQuota">Require LD sales quota</Label>
+          </div>
+          {form.hasQuota && (
+            <>
+              <Label htmlFor="quotaAmount">Quota amount (₱ LD sales)</Label>
+              <Input
+                id="quotaAmount"
+                type="number"
+                min={0}
+                step={0.01}
+                value={form.quotaAmount || ""}
+                onChange={(e) => setForm((f) => ({ ...f, quotaAmount: Number(e.target.value) || 0 }))}
+              />
+            </>
+          )}
         </div>
       </div>
 

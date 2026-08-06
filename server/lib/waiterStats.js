@@ -46,6 +46,7 @@ export async function getWaiterDayStats(db, branchId, userId, workDate) {
      WHERE o.branch_id = ? AND o.order_date = ?
        AND o.status IN ('pending','paid') AND oi.department = 'LD'
        AND COALESCE(oi.is_voided, 0) = 0
+       AND COALESCE(oi.is_complimentary, 0) = 0
        AND ${attribution}`,
     `SELECT COALESCE(SUM(CASE WHEN o.status = 'paid' THEN oi.quantity ELSE 0 END), 0) AS ldCountPaid,
             COALESCE(SUM(CASE WHEN o.status = 'pending' THEN oi.quantity ELSE 0 END), 0) AS ldCountOpen,

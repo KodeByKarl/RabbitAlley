@@ -162,10 +162,14 @@ export const api = {
       if (params?.limit) q.set("limit", String(params.limit));
       return fetchApi<ChargeTransaction[]>("/api/charges" + (q.toString() ? "?" + q.toString() : ""));
     },
-    markPaid: (id: string, paidBy?: string) =>
-      fetchApi<{ ok: boolean }>(`/api/charges/${id}/mark-paid`, {
+    markPaid: (id: string, paidBy?: string, opts?: { paymentMethod?: string; shiftId?: string | number }) =>
+      fetchApi<{ ok: boolean; collectionMethod?: string; shiftId?: number | null }>(`/api/charges/${id}/mark-paid`, {
         method: "PATCH",
-        body: JSON.stringify({ paidBy }),
+        body: JSON.stringify({
+          paidBy,
+          paymentMethod: opts?.paymentMethod,
+          shiftId: opts?.shiftId,
+        }),
       }),
   },
   auditLogs: {
@@ -261,8 +265,31 @@ export const api = {
           voided: boolean;
         }>;
       }>(`/api/orders/lookup?orderNumber=${encodeURIComponent(orderNumber)}`),
-    pay: (orderId: string, paymentMethod?: string) =>
-      fetchApi<{ ok: boolean }>(`/api/orders/${orderId}/pay`, { method: "PATCH", body: JSON.stringify({ paymentMethod }) }),
+    pay: (
+      orderId: string,
+      paymentMethodOrBody?:
+        | string
+        | {
+            paymentMethod?: string;
+            discountAmount?: number;
+            customerName?: string;
+            splits?: Array<{ amount: number; paymentMethod: string; customerName?: string }>;
+            amountReceived?: number;
+          }
+    ) => {
+      const body =
+        typeof paymentMethodOrBody === "string" || paymentMethodOrBody == null
+          ? { paymentMethod: paymentMethodOrBody }
+          : paymentMethodOrBody;
+      return fetchApi<{
+        ok: boolean;
+        total?: number;
+        discount?: number;
+        tax?: number;
+        changeAmount?: number;
+        amountReceived?: number;
+      }>(`/api/orders/${orderId}/pay`, { method: "PATCH", body: JSON.stringify(body) });
+    },
     void: (orderId: string, data: { employeeId: string; password: string; reason: string }) =>
       fetchApi<{ ok: boolean; voidedByName: string }>(`/api/orders/${orderId}/void`, { method: "POST", body: JSON.stringify(data) }),
     detail: (orderId: string) =>
@@ -588,11 +615,14 @@ export const api = {
         summary: {
           totalOrders: number;
           totalSessions?: number;
+          paidOrders?: number;
           totalSales: number;
           totalDiscounts: number;
           totalComplimentary: number;
           totalTax: number;
           totalCardSurcharge: number;
+          openTabsCount?: number;
+          openTabsTotal?: number;
         };
       }>("/api/reports/sales?" + q.toString());
     },
@@ -651,11 +681,13 @@ export const api = {
         product?: string;
         tableId?: string;
         q?: string;
-      }
+      },
+      dayStartHour?: number | null
     ) => {
       const params = new URLSearchParams();
       if (from) params.set("from", from);
       if (to) params.set("to", to || from || new Date().toISOString().slice(0, 10));
+      if (dayStartHour != null && dayStartHour >= 0 && dayStartHour <= 23) params.set("dayStartHour", String(dayStartHour));
       if (filters?.staffId) params.set("staffId", filters.staffId);
       if (filters?.staffName) params.set("staffName", filters.staffName);
       if (filters?.product) params.set("product", filters.product);
@@ -684,7 +716,7 @@ export const api = {
           voidedAtDisplay: string;
           reason: string;
         }>;
-        summary: { totalVoids: number; totalQuantity: number; totalAmount: number };
+        summary: { totalVoids: number; totalQuantity: number; totalAmount: number; listed?: number; truncated?: boolean; limit?: number };
       }>("/api/reports/voids?" + params.toString());
     },
     payroll: (from?: string, to?: string, dayStartHour?: number | null) => {
@@ -1028,7 +1060,7 @@ export const api = {
         receipt: Record<string, unknown>;
       }>(`/api/tables/${tableId}/running-bill-snapshot`),
     transfer: (data: { orderId?: string; fromTable: string; toTable: string; transferredBy: string; reason?: string; transferAll?: boolean }) =>
-      fetchApi<{ ok: boolean; message: string }>("/api/tables/transfer", { method: "POST", body: JSON.stringify(data) }),
+      fetchApi<{ ok: boolean; message: string; action?: "move" | "swap" }>("/api/tables/transfer", { method: "POST", body: JSON.stringify(data) }),
     merge: (data: { sourceOrderId: string; targetOrderId: string; transferredBy: string; reason?: string }) =>
       fetchApi<{ ok: boolean; message: string }>("/api/tables/merge", { method: "POST", body: JSON.stringify(data) }),
     getTransfers: (orderId: string) =>
@@ -1119,9 +1151,19 @@ export interface ShiftSummary {
     card: number;
     gcash: number;
     bank: number;
+    charge?: number;
     total: number;
+    tenderTotal?: number;
     transactionCount: number;
   };
+  chargeCollections?: {
+    cash: number;
+    card: number;
+    gcash: number;
+    bank: number;
+    total: number;
+  };
+  conversionCash?: number;
   refunds: number;
   voids: number;
   conversions?: Array<{ fromMethod: string; toMethod: string; amount: number; notes?: string; convertedBy?: string; convertedAt?: string }>;
@@ -1144,7 +1186,9 @@ export interface ChargeTransaction {
   orderIds?: string;
   customerName: string;
   amount: number;
-  status: "pending" | "paid";
+  status: "pending" | "paid" | "cancelled";
+  collectionMethod?: string | null;
+  shiftId?: number | null;
   chargedAt: string;
   paidAt?: string;
   chargedBy?: string;

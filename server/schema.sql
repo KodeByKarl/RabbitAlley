@@ -177,6 +177,8 @@ CREATE TABLE IF NOT EXISTS orders (
   subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
   discount DECIMAL(12,2) NOT NULL DEFAULT 0,
   tax DECIMAL(12,2) NOT NULL DEFAULT 0,
+  service_charge DECIMAL(12,2) NOT NULL DEFAULT 0,
+  card_surcharge DECIMAL(12,2) NOT NULL DEFAULT 0,
   total DECIMAL(12,2) NOT NULL DEFAULT 0,
   employee_id VARCHAR(32) DEFAULT NULL,
   order_date DATE NOT NULL,
@@ -437,7 +439,9 @@ CREATE TABLE IF NOT EXISTS charge_transactions (
   order_ids TEXT DEFAULT NULL,
   customer_name VARCHAR(128) NOT NULL,
   amount DECIMAL(12,2) NOT NULL,
-  status ENUM('pending','paid') NOT NULL DEFAULT 'pending',
+  status ENUM('pending','paid','cancelled') NOT NULL DEFAULT 'pending',
+  collection_method VARCHAR(32) DEFAULT NULL,  -- cash/gcash/bank/card when utang is collected
+  shift_id INT UNSIGNED DEFAULT NULL,          -- shift during which collection was recorded
   charged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   paid_at DATETIME DEFAULT NULL,
   charged_by VARCHAR(64) DEFAULT NULL,
@@ -447,6 +451,7 @@ CREATE TABLE IF NOT EXISTS charge_transactions (
   KEY idx_charges_customer (customer_name(64)),
   KEY idx_charges_status (status),
   KEY idx_charges_date (charged_at),
+  KEY idx_charges_paid_at (paid_at),
   FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE RESTRICT
 );
 

@@ -1,6 +1,8 @@
+import { localDateString } from "./localDate.js";
+
 /** Human-readable order number: YYYYMMDD-0001 (per branch, per calendar day). */
 export async function allocateOrderNumber(conn, branchId, orderDate) {
-  const dateStr = String(orderDate || new Date().toISOString().slice(0, 10));
+  const dateStr = String(orderDate || localDateString());
   await conn.execute(
     `INSERT INTO order_number_sequences (branch_id, seq_date, last_seq)
      VALUES (?, ?, 1)

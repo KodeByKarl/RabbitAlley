@@ -77,10 +77,16 @@ export default function Charges() {
 
   const handleMarkPaid = async (charge: ChargeTransaction) => {
     if (charge.status === "paid") return;
+    const methodRaw = window.prompt(
+      "Collection method when customer pays utang (cash, gcash, bank, debit, credit):",
+      "cash"
+    );
+    if (methodRaw == null) return;
+    const paymentMethod = String(methodRaw).trim().toLowerCase() || "cash";
     setMarkingPaid(charge.id);
     try {
-      await api.charges.markPaid(String(charge.id), user?.name);
-      toast.success(`Marked as paid: ${charge.customerName}`);
+      await api.charges.markPaid(String(charge.id), user?.name, { paymentMethod });
+      toast.success(`Marked as paid: ${charge.customerName} (${paymentMethod})`);
       loadCharges();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to mark as paid");

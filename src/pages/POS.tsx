@@ -203,21 +203,28 @@ export default function POS() {
       toast.error("Source table must have an active order");
       return;
     }
-    if (target?.status !== "available" || target.currentOrderId) {
-      toast.error("Target table must be available (no active order)");
+    if (!target) {
+      toast.error("Select a target table");
       return;
     }
 
+    const willSwap = Boolean(target.currentOrderId) || target.status === "occupied";
+
     setTransferring(true);
     try {
-      await api.tables.transfer({
+      const result = await api.tables.transfer({
         fromTable: source.id,
         toTable: target.id,
         transferredBy: user?.id || "0",
         reason: transferReason.trim() || undefined,
         transferAll: true,
       });
-      toast.success(`All orders moved from ${source.area} - ${source.name} to ${target.area} - ${target.name}`);
+      const swapped = result.action === "swap" || willSwap;
+      toast.success(
+        swapped
+          ? `Swapped ${source.area} - ${source.name} with ${target.area} - ${target.name}`
+          : `Moved all orders from ${source.area} - ${source.name} to ${target.area} - ${target.name}`
+      );
       setTransferOpen(false);
       loadTables();
     } catch (e) {
@@ -419,7 +426,7 @@ export default function POS() {
           <DialogHeader>
             <DialogTitle>Transfer Table</DialogTitle>
             <p className="text-sm text-muted-foreground">
-              Move the whole order from one table to another open table (e.g. guests moving to a different table or area).
+              Move to an empty table, or swap with an occupied one (bills stay separate). Use Merge to combine into one bill.
             </p>
           </DialogHeader>
           <form onSubmit={handleTransferTable} className="space-y-4">
@@ -439,15 +446,16 @@ export default function POS() {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>To table (must be available)</Label>
+              <Label>To table (empty = move, occupied = swap)</Label>
               <Select value={transferTargetTableId} onValueChange={setTransferTargetTableId}>
-                <SelectTrigger><SelectValue placeholder="Select available table" /></SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Select any other table" /></SelectTrigger>
                 <SelectContent>
                   {tables
-                    .filter((t) => t.status === "available")
+                    .filter((t) => t.id !== transferSourceTableId)
                     .map((t) => (
                       <SelectItem key={t.id} value={t.id}>
                         {t.area} - {t.name}
+                        {t.status === "occupied" || t.currentOrderId ? " (swap)" : " (move)"}
                       </SelectItem>
                     ))}
                 </SelectContent>

@@ -8,6 +8,7 @@
     "dev": "nodemon index.js",
     "seed-admin": "node seed-admin.js",
     "seed-verify-all": "node scripts/seed-verify-all.js",
+    "seed-transfer-swap": "node scripts/seed-transfer-swap.js",
     "seed-payroll": "node scripts/seed-payroll-pending-ld.js",
     "print-receipt": "node scripts/print-receipt.js",
     "migrate-sessions": "node scripts/migrate-table-sessions.js"

@@ -154,6 +154,71 @@ export async function logVoidsForOrder(db, {
 }
 
 /**
+ * Audit log when a completed payment is voided (order returns to pending; items stay non-voided).
+ * Uses void_type = 'payment' so Void Report can distinguish from item/order voids.
+ */
+export async function logPaymentVoidForOrder(db, {
+  branchId,
+  orderId,
+  reason,
+  manager,
+  employeeId = null,
+}) {
+  let itemIds;
+  try {
+    const [rows] = await db.execute(
+      `SELECT id FROM order_items WHERE order_id = ? AND COALESCE(is_voided, 0) = 0`,
+      [orderId]
+    );
+    itemIds = (rows || []).map((r) => r.id);
+  } catch (e) {
+    if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+    const [rows] = await db.execute(`SELECT id FROM order_items WHERE order_id = ?`, [orderId]);
+    itemIds = (rows || []).map((r) => r.id);
+  }
+  if (!itemIds.length) {
+    // Still record a single audit row when the paid order has no live lines.
+    const reasonText = normalizeVoidReason(reason || "Payment void");
+    const [orders] = await db.execute(
+      `SELECT id, table_id AS tableId, session_id AS sessionId, branch_id AS branchId, total
+       FROM orders WHERE id = ?`,
+      [orderId]
+    );
+    const o = orders[0];
+    if (!o) return 0;
+    await db.execute(
+      `INSERT INTO void_log
+        (branch_id, void_type, order_id, order_item_id, product_id, product_sku, product_name,
+         quantity, unit_price, amount, table_id, session_id,
+         voided_by, voided_by_name, voided_by_employee_id, voided_at, reason)
+       VALUES (?, 'payment', ?, NULL, NULL, NULL, ?, 1, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+      [
+        o.branchId ?? branchId,
+        orderId,
+        "PAYMENT VOID",
+        Number(o.total) || 0,
+        Number(o.total) || 0,
+        o.tableId || null,
+        o.sessionId != null ? Number(o.sessionId) : null,
+        manager?.id ?? null,
+        manager?.name || null,
+        employeeId || null,
+        reasonText,
+      ]
+    );
+    return 1;
+  }
+  return logVoidsForOrderItems(db, {
+    branchId,
+    orderItemIds: itemIds,
+    voidType: "payment",
+    reason: reason || "Payment void",
+    manager,
+    employeeId,
+  });
+}
+
+/**
  * Backfill void_log from existing voided order_items (reason = legacy placeholder).
  */
 export async function backfillLegacyVoids(db) {

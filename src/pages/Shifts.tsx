@@ -36,7 +36,7 @@ import {
 } from "@/components/ui/select";
 import { toast } from "sonner";
 import { 
-  Clock, DollarSign, CreditCard, Smartphone, Building2, 
+  Clock, DollarSign, CreditCard, Smartphone, Building2, Receipt,
   TrendingUp, TrendingDown, AlertTriangle, Check, Printer,
   PlayCircle, StopCircle, Calculator, RefreshCw, ArrowRightLeft
 } from "lucide-react";
@@ -239,17 +239,19 @@ export default function Shifts() {
   const buildReportHtml = (
     shift: ShiftListItem | ShiftSummary["shift"],
     summary?: ShiftSummary
-  ): { html: string; reportType: string; isZReport: boolean; sales: { cash: number; card: number; gcash: number; bank: number; total: number } } => {
+  ): { html: string; reportType: string; isZReport: boolean; sales: { cash: number; card: number; gcash: number; bank: number; charge: number; total: number } } => {
     const s = summary?.shift || shift as ShiftListItem;
     const sales = summary?.sales || {
       cash: Number((shift as ShiftListItem).total_cash_sales || 0),
       card: Number((shift as ShiftListItem).total_card_sales || 0),
       gcash: Number((shift as ShiftListItem).total_gcash_sales || 0),
       bank: Number((shift as ShiftListItem).total_bank_sales || 0),
+      charge: 0,
       total: 0,
       transactionCount: 0,
     };
-    sales.total = sales.cash + sales.card + sales.gcash + sales.bank;
+    const charge = Number(sales.charge || 0);
+    sales.total = sales.cash + sales.card + sales.gcash + sales.bank + charge;
     const isZReport = s.status === "closed" || s.status === "approved";
     const reportType = isZReport ? "Z REPORT" : "X REPORT";
     const html = `<!DOCTYPE html><html><head><title>${reportType}</title><style>
@@ -279,6 +281,7 @@ export default function Shifts() {
         <div class="row"><span>Card Sales:</span><span>${formatCurrency(sales.card)}</span></div>
         <div class="row"><span>GCash Sales:</span><span>${formatCurrency(sales.gcash)}</span></div>
         <div class="row"><span>Bank Transfer:</span><span>${formatCurrency(sales.bank)}</span></div>
+        <div class="row"><span>Charge/Utang:</span><span>${formatCurrency(charge)}</span></div>
         <div class="row bold"><span>TOTAL SALES:</span><span>${formatCurrency(sales.total)}</span></div>
       </div>
       ${isZReport ? `
@@ -452,6 +455,25 @@ export default function Shifts() {
                   </span>
                   <span className="font-medium">{formatCurrency(shiftSummary.sales.bank)}</span>
                 </div>
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-2">
+                    <Receipt className="h-4 w-4 text-orange-500" />
+                    Charge/Utang (AR):
+                  </span>
+                  <span className="font-medium">{formatCurrency(shiftSummary.sales.charge || 0)}</span>
+                </div>
+                {(shiftSummary.chargeCollections?.total || 0) > 0 && (
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-muted-foreground">Utang collected (cash):</span>
+                    <span className="font-medium">{formatCurrency(shiftSummary.chargeCollections?.cash || 0)}</span>
+                  </div>
+                )}
+                {(shiftSummary.conversionCash || 0) > 0 && (
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-muted-foreground">Conversions → cash:</span>
+                    <span className="font-medium">{formatCurrency(shiftSummary.conversionCash || 0)}</span>
+                  </div>
+                )}
                 <div className="border-t pt-3 flex items-center justify-between font-bold">
                   <span>Total Sales:</span>
                   <span className="text-lg">{formatCurrency(shiftSummary.sales.total)}</span>
@@ -807,6 +829,10 @@ export default function Shifts() {
                   <span className="text-muted-foreground">Bank Transfer:</span>
                   <span className="font-medium">{formatCurrency(shiftSummary.sales.bank)}</span>
                 </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Charge/Utang:</span>
+                  <span className="font-medium">{formatCurrency(shiftSummary.sales.charge || 0)}</span>
+                </div>
                 <div className="border-t pt-2 flex justify-between font-bold">
                   <span>Total Sales:</span>
                   <span>{formatCurrency(shiftSummary.sales.total)}</span>
@@ -904,6 +930,7 @@ export default function Shifts() {
                             <div className="flex justify-between"><span>Card Sales:</span><span>{formatCurrency(sales.card)}</span></div>
                             <div className="flex justify-between"><span>GCash Sales:</span><span>{formatCurrency(sales.gcash)}</span></div>
                             <div className="flex justify-between"><span>Bank Transfer:</span><span>{formatCurrency(sales.bank)}</span></div>
+                            <div className="flex justify-between"><span>Charge/Utang:</span><span>{formatCurrency(sales.charge || 0)}</span></div>
                             <div className="flex justify-between font-bold pt-1"><span>TOTAL SALES:</span><span>{formatCurrency(sales.total)}</span></div>
                           </div>
                         </div>

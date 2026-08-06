@@ -1,6 +1,7 @@
 /**
  * Product pricing: multiple price entries per SKU/product (inventory identity stays on products).
  */
+import { localDateString } from "./localDate.js";
 
 const AREAS = ["Lounge", "Club", "LD"];
 
@@ -56,7 +57,7 @@ export async function ensureProductPricingSchema(db) {
 }
 
 function todayStr() {
-  return new Date().toISOString().slice(0, 10);
+  return localDateString();
 }
 
 function isEffective(row, onDate) {

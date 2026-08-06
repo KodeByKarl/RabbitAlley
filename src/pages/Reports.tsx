@@ -151,7 +151,12 @@ interface PayrollRow {
   approvedBy: string | null;
 }
 
-const today = new Date().toISOString().split("T")[0];
+const today = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Manila",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+}).format(new Date());
 
 
 /** Format period (dateFrom, dateTo) as "Salary Slip for July 2025" */
@@ -524,11 +529,14 @@ export default function Reports() {
   const [salesSummary, setSalesSummary] = useState({
     totalOrders: 0,
     totalSessions: 0,
+    paidOrders: 0,
     totalSales: 0,
     totalDiscounts: 0,
     totalComplimentary: 0,
     totalTax: 0,
     totalCardSurcharge: 0,
+    openTabsCount: 0,
+    openTabsTotal: 0,
   });
   const [productRows, setProductRows] = useState<ProductReportRow[]>([]);
   const [productSummary, setProductSummary] = useState({
@@ -548,7 +556,13 @@ export default function Reports() {
   const [productPrintOpen, setProductPrintOpen] = useState(false);
   const [productPrintStep, setProductPrintStep] = useState<"preparing" | "printing" | "done">("preparing");
   const [voidRows, setVoidRows] = useState<VoidReportRow[]>([]);
-  const [voidSummary, setVoidSummary] = useState({ totalVoids: 0, totalQuantity: 0, totalAmount: 0 });
+  const [voidSummary, setVoidSummary] = useState({
+    totalVoids: 0,
+    totalQuantity: 0,
+    totalAmount: 0,
+    listed: 0,
+    truncated: false,
+  });
   const [loadingVoids, setLoadingVoids] = useState(false);
   const [filterVoidStaff, setFilterVoidStaff] = useState("");
   const [filterVoidProduct, setFilterVoidProduct] = useState("");
@@ -665,8 +679,16 @@ export default function Reports() {
       setOrderDetailsById({});
       setLoadingOrderIds({});
       setSalesSummary({
-        ...res.summary,
+        totalOrders: res.summary.totalOrders ?? 0,
         totalSessions: res.summary.totalSessions ?? 0,
+        paidOrders: res.summary.paidOrders ?? 0,
+        totalSales: res.summary.totalSales ?? 0,
+        totalDiscounts: res.summary.totalDiscounts ?? 0,
+        totalComplimentary: res.summary.totalComplimentary ?? 0,
+        totalTax: res.summary.totalTax ?? 0,
+        totalCardSurcharge: res.summary.totalCardSurcharge ?? 0,
+        openTabsCount: res.summary.openTabsCount ?? 0,
+        openTabsTotal: res.summary.openTabsTotal ?? 0,
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load sales report");
@@ -793,21 +815,29 @@ export default function Reports() {
     setLoadingVoids(true);
     setError(null);
     try {
-      const res = await api.reports.voids(dateFrom, dateTo, {
-        staffName: filterVoidStaff.trim() || undefined,
-        product: filterVoidProduct.trim() || undefined,
-        tableId: filterVoidTableId.trim() || undefined,
-        q: voidSearch.trim() || undefined,
-      });
+      const hour = dayStartHour === "" ? undefined : Number(dayStartHour);
+      const res = await api.reports.voids(
+        dateFrom,
+        dateTo,
+        {
+          staffName: filterVoidStaff.trim() || undefined,
+          product: filterVoidProduct.trim() || undefined,
+          tableId: filterVoidTableId.trim() || undefined,
+          q: voidSearch.trim() || undefined,
+        },
+        hour
+      );
       setVoidRows(res.list || []);
-      setVoidSummary(res.summary || { totalVoids: 0, totalQuantity: 0, totalAmount: 0 });
+      setVoidSummary(
+        res.summary || { totalVoids: 0, totalQuantity: 0, totalAmount: 0, listed: 0, truncated: false }
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load void report");
       setVoidRows([]);
     } finally {
       setLoadingVoids(false);
     }
-  }, [canViewVoids, dateFrom, dateTo, filterVoidStaff, filterVoidProduct, filterVoidTableId, voidSearch]);
+  }, [canViewVoids, dateFrom, dateTo, dayStartHour, filterVoidStaff, filterVoidProduct, filterVoidTableId, voidSearch]);
 
   const startVoidReportPrint = useCallback(() => {
     if (!voidRows.length) {
@@ -1191,7 +1221,7 @@ export default function Reports() {
           doc.text(`Sales Report ${dateFrom} to ${dateTo}`, 14, 12);
           doc.setFontSize(10);
           doc.text(
-            `Sessions: ${salesSummary.totalSessions}  |  Order lines: ${salesSummary.totalOrders}  |  Total Sales: ₱${salesSummary.totalSales.toFixed(2)}  |  Discount: ₱${salesSummary.totalDiscounts.toFixed(2)}  |  Tax: ₱${salesSummary.totalTax.toFixed(2)}`,
+            `Sessions: ${salesSummary.totalSessions}  |  Order lines: ${salesSummary.totalOrders}  |  Total Sales: ₱${salesSummary.totalSales.toFixed(2)}  |  Open Tabs: ₱${salesSummary.openTabsTotal.toFixed(2)}  |  Discount: ₱${salesSummary.totalDiscounts.toFixed(2)}  |  Tax: ₱${salesSummary.totalTax.toFixed(2)}`,
             14,
             20
           );
@@ -1902,7 +1932,7 @@ export default function Reports() {
           <Filter className="w-4 h-4 mr-2" />
           Filter
         </Button>
-        {(activeTab === "sales" || activeTab === "products" || activeTab === "payroll") && (
+        {(activeTab === "sales" || activeTab === "products" || activeTab === "payroll" || activeTab === "voids") && (
           <div className="flex items-center gap-2">
             <span className="text-sm text-muted-foreground">Operational day start (hour 0–23):</span>
             <Input
@@ -1914,7 +1944,7 @@ export default function Reports() {
               value={dayStartHour}
               onChange={(e) => setDayStartHour(e.target.value === "" ? "" : Math.min(23, Math.max(0, parseInt(e.target.value, 10) || 0)))}
             />
-            <span className="text-xs text-muted-foreground">Applies to Sales, Product, and Payroll. Leave empty for calendar day. Set 4 so &quot;March 9&quot; = Mar 9 4am – Mar 10 3:59am.</span>
+            <span className="text-xs text-muted-foreground">Applies to Sales, Product, Payroll, and Voids. Leave empty for calendar day. Set 4 so &quot;March 9&quot; = Mar 9 4am – Mar 10 3:59am.</span>
           </div>
         )}
         {activeTab === "payroll" && (
@@ -1927,7 +1957,7 @@ export default function Reports() {
 
       {activeTab === "sales" && (
         <>
-          <div className="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-6">
+          <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-4 mb-6">
             <StatCard
               label="Table sessions"
               value={salesSummary.totalSessions}
@@ -1944,6 +1974,11 @@ export default function Reports() {
               icon={<DollarSign className="w-5 h-5" />}
             />
             <StatCard
+              label="Open Tabs"
+              value={formatCurrency(salesSummary.openTabsTotal)}
+              icon={<Clock className="w-5 h-5" />}
+            />
+            <StatCard
               label="Discounts"
               value={formatCurrency(salesSummary.totalDiscounts)}
               icon={<Percent className="w-5 h-5" />}
@@ -1957,6 +1992,11 @@ export default function Reports() {
               label="Card Surcharge"
               value={formatCurrency(salesSummary.totalCardSurcharge)}
               icon={<CreditCard className="w-5 h-5" />}
+            />
+            <StatCard
+              label="Complimentary"
+              value={formatCurrency(salesSummary.totalComplimentary)}
+              icon={<Package className="w-5 h-5" />}
             />
           </div>
 
@@ -2172,8 +2212,8 @@ export default function Reports() {
       {activeTab === "products" && (
         <>
           <p className="text-sm text-muted-foreground mb-4">
-            Paid / billed items only (by SKU). Open tabs and voided lines are excluded. Stock moves on payment so
-            quantities reconcile with inventory.
+            Paid / billed items only (by SKU). Open tabs, voided lines, and complimentary items are excluded. Stock
+            moves on payment so quantities reconcile with inventory.
           </p>
           <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
             <StatCard
@@ -2311,6 +2351,9 @@ export default function Reports() {
         <>
           <p className="text-sm text-muted-foreground mb-4">
             Every voided line with who authorized it and why. Manager / Admin only.
+            {voidSummary.truncated
+              ? ` Showing ${voidSummary.listed} of ${voidSummary.totalVoids} rows — totals still include all voids.`
+              : ""}
           </p>
           <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
             <StatCard label="Void events" value={voidSummary.totalVoids} icon={<Ban className="w-5 h-5" />} />
