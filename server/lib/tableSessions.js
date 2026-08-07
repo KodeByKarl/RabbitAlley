@@ -393,7 +393,7 @@ export async function transferOpenSession(db, branchId, fromTable, toTable) {
 /**
  * Swap open sessions between two tables (each party keeps its own session/bill).
  * Call after pending orders have already had their table_id values exchanged.
- * Uses a temporary table_id so both open sessions never collide on the same table.
+ * Uses a single CASE UPDATE (no temp table_id — fits VARCHAR(16)).
  */
 export async function swapOpenSessions(db, branchId, tableA, tableB) {
   const sessionA = await getOpenSession(db, branchId, tableA);
@@ -401,12 +401,17 @@ export async function swapOpenSessions(db, branchId, tableA, tableB) {
 
   if (!sessionA && !sessionB) return { sessionOnA: null, sessionOnB: null };
 
-  const tempTableId = `__swap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
   if (sessionA && sessionB) {
-    await db.execute(`UPDATE table_sessions SET table_id = ? WHERE id = ?`, [tempTableId, sessionA.id]);
-    await db.execute(`UPDATE table_sessions SET table_id = ? WHERE id = ?`, [tableA, sessionB.id]);
-    await db.execute(`UPDATE table_sessions SET table_id = ? WHERE id = ?`, [tableB, sessionA.id]);
+    await db.execute(
+      `UPDATE table_sessions
+       SET table_id = CASE id
+         WHEN ? THEN ?
+         WHEN ? THEN ?
+         ELSE table_id
+       END
+       WHERE id IN (?, ?)`,
+      [sessionA.id, tableB, sessionB.id, tableA, sessionA.id, sessionB.id]
+    );
     return { sessionOnA: Number(sessionB.id), sessionOnB: Number(sessionA.id) };
   }
 

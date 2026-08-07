@@ -10,11 +10,16 @@
  */
 import "dotenv/config";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import express from "express";
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -5121,31 +5126,58 @@ app.get("/api/database/backups", requireAnyPermission("manage_settings"), async 
   }
 });
 
-// Shortcut creation endpoint
+// Shortcut creation endpoint — uses PowerShell -EncodedCommand to avoid quote/semicolon bugs
 app.post("/api/system/create-shortcut", requireAnyPermission("manage_settings"), async (req, res) => {
   try {
+    if (process.platform !== "win32") {
+      return res.status(400).json({ error: "Desktop shortcuts are only supported on Windows" });
+    }
+
     const projectRoot = path.resolve(path.join(__dirname, ".."));
     const batPath = path.join(projectRoot, "start.bat");
-    
-    const psCommand = `
-      $WshShell = New-Object -ComObject WScript.Shell
-      $Shortcut = $WshShell.CreateShortcut("$HOME\\\\Desktop\\\\Rabbit Alley POS.lnk")
-      $Shortcut.TargetPath = "${batPath.replace(/\\/g, '\\\\')}"
-      $Shortcut.WorkingDirectory = "${projectRoot.replace(/\\/g, '\\\\')}"
-      $Shortcut.IconLocation = "cmd.exe"
-      $Shortcut.Save()
-    `;
-    
-    const { exec } = await import("child_process");
-    exec(`powershell -Command "${psCommand.trim().replace(/\s+/g, ' ')}"`, (err) => {
-      if (err) {
-        console.error("Shortcut creation failed:", err);
-        return res.status(500).json({ error: "Failed to create desktop shortcut: " + err.message });
-      }
-      res.json({ ok: true, message: "Desktop shortcut created successfully" });
-    });
+    if (!fs.existsSync(batPath)) {
+      return res.status(404).json({ error: `start.bat not found at ${batPath}` });
+    }
+
+    const iconCandidates = [
+      path.join(projectRoot, "public", "rabbit-icon.ico"),
+      path.join(projectRoot, "public", "rabbit-icon.svg"),
+    ];
+    const iconPath = iconCandidates.find((p) => fs.existsSync(p)) || "cmd.exe,0";
+
+    const psQuote = (value) => `'${String(value).replace(/'/g, "''")}'`;
+    // Resolve real Desktop (handles OneDrive-redirected Desktop folders)
+    const psScript = [
+      "$desktop = [Environment]::GetFolderPath('Desktop')",
+      "if (-not $desktop) { $desktop = Join-Path $env:USERPROFILE 'Desktop' }",
+      `$lnk = Join-Path $desktop 'Rabbit Alley POS.lnk'`,
+      "$WshShell = New-Object -ComObject WScript.Shell",
+      "$Shortcut = $WshShell.CreateShortcut($lnk)",
+      `$Shortcut.TargetPath = ${psQuote(batPath)}`,
+      `$Shortcut.WorkingDirectory = ${psQuote(projectRoot)}`,
+      `$Shortcut.IconLocation = ${psQuote(iconPath)}`,
+      "$Shortcut.Save()",
+      "if (-not (Test-Path -LiteralPath $lnk)) { throw 'Shortcut file was not created' }",
+      "Write-Output $lnk",
+    ].join("; ");
+
+    // UTF-16LE base64 avoids nested-quote breakage from powershell -Command "..."
+    const encoded = Buffer.from(psScript, "utf16le").toString("base64");
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      { windowsHide: true, timeout: 15000 }
+    );
+
+    const shortcutPath = String(stdout || "").trim() || path.join(os.homedir(), "Desktop", "Rabbit Alley POS.lnk");
+    if (!fs.existsSync(shortcutPath)) {
+      return res.status(500).json({ error: "Shortcut command finished but .lnk was not created on Desktop" });
+    }
+
+    res.json({ ok: true, message: "Desktop shortcut created successfully", path: shortcutPath });
   } catch (err) {
-    res.status(500).json({ error: "Failed to create desktop shortcut: " + err.message });
+    console.error("Shortcut creation failed:", err);
+    res.status(500).json({ error: "Failed to create desktop shortcut: " + (err.stderr || err.message) });
   }
 });
 
@@ -6801,24 +6833,29 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
       const targetIds = targetPending.map((r) => r.id);
       const swapReason = reason?.trim() ? `swap: ${reason.trim()}` : "swap";
 
-      // Park source orders on a temp table_id so both sides can move without collision
-      const parkId = `__xfer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      // Atomic swap — CASE uses pre-update values, so no temp table_id (VARCHAR(16) safe)
+      await db.execute(
+        `UPDATE orders
+         SET table_id = CASE table_id
+           WHEN ? THEN ?
+           WHEN ? THEN ?
+           ELSE table_id
+         END
+         WHERE branch_id = ? AND status = 'pending' AND table_id IN (?, ?)`,
+        [fromTable, toTable, toTable, fromTable, branchId, fromTable, toTable]
+      );
+
       for (const oid of sourceIds) {
-        await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [parkId, oid]);
-      }
-      for (const oid of targetIds) {
-        await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [fromTable, oid]);
-        await db.execute(`
-          INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason)
-          VALUES (?, ?, ?, 'move', ?, ?)
-        `, [oid, toTable, fromTable, transferredBy || null, swapReason]);
-      }
-      for (const oid of sourceIds) {
-        await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [toTable, oid]);
         await db.execute(`
           INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason)
           VALUES (?, ?, ?, 'move', ?, ?)
         `, [oid, fromTable, toTable, transferredBy || null, swapReason]);
+      }
+      for (const oid of targetIds) {
+        await db.execute(`
+          INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason)
+          VALUES (?, ?, ?, 'move', ?, ?)
+        `, [oid, toTable, fromTable, transferredBy || null, swapReason]);
       }
 
       try {
