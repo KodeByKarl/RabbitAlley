@@ -1,4 +1,6 @@
 /** Map a joined order_items row to API item shape. */
+import { getOpenSession, appendLivePendingSessionFilter, closeStaleOpenSessionIfNeeded } from "./tableSessions.js";
+
 export function mapOrderItemRow(i) {
   return {
     id: String(i.id),
@@ -94,17 +96,26 @@ const ORDER_HEADER_SELECT = `id, table_id, status, subtotal, discount, tax, tota
 const ORDER_HEADER_SELECT_LEGACY = `id, table_id, status, subtotal, discount, tax, total, employee_id, order_date`;
 
 export async function fetchPendingOrdersForTable(db, tableId, branchId) {
+  await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
+  const session = await getOpenSession(db, branchId, tableId);
+  const live = appendLivePendingSessionFilter(session);
   try {
     const [orders] = await db.execute(
-      `SELECT ${ORDER_HEADER_SELECT} FROM orders WHERE table_id = ? AND status = 'pending' AND branch_id = ? AND voided_at IS NULL ORDER BY id`,
-      [tableId, branchId]
+      `SELECT ${ORDER_HEADER_SELECT} FROM orders
+       WHERE table_id = ? AND status = 'pending' AND branch_id = ? AND voided_at IS NULL
+       ${live.sql}
+       ORDER BY id`,
+      [tableId, branchId, ...live.params]
     );
     return orders;
   } catch (e) {
     if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
     const [orders] = await db.execute(
-      `SELECT ${ORDER_HEADER_SELECT_LEGACY} FROM orders WHERE table_id = ? AND status = 'pending' AND branch_id = ? ORDER BY id`,
-      [tableId, branchId]
+      `SELECT ${ORDER_HEADER_SELECT_LEGACY} FROM orders
+       WHERE table_id = ? AND status = 'pending' AND branch_id = ?
+       ${live.sql}
+       ORDER BY id`,
+      [tableId, branchId, ...live.params]
     );
     return (orders || []).map((o) => ({ ...o, order_number: null, voided_at: null, voided_by: null, voided_by_name: null }));
   }

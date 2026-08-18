@@ -31,7 +31,14 @@ import ThermalPrinter from "node-thermal-printer";
 import { buildCustomerReceipt, buildDeptChit, buildOrderSlip, buildRunningBill, buildPayslip } from "./lib/receiptEscPos.js";
 import { printEscPosBuffer, resolvePrinterInterface } from "./lib/printToThermal.js";
 import { buildCustomerReceiptHtml, buildRunningBillHtml, buildOrderSlipHtml } from "./lib/receiptBrowserHtml.js";
-import { computePayslipGross, computePayslipNet } from "./lib/payrollTotals.js";
+import {
+  computePayslipGross,
+  computePayslipNet,
+  ensurePayoutsSchema,
+  LATEST_PAYOUT_PER_USER_JOIN,
+  latestPayoutPerUserParams,
+  dedupePayrollRows,
+} from "./lib/payrollTotals.js";
 import { allocateOrderNumber, formatOrderDisplayNumber } from "./lib/orderNumbers.js";
 import {
   normalizePaymentMethod,
@@ -46,7 +53,13 @@ import {
 } from "./lib/orderQueries.js";
 import { getWaiterDayStats } from "./lib/waiterStats.js";
 import { localDateString } from "./lib/localDate.js";
-import { buildRevenueDayFilter, buildTimestampDayFilter, REVENUE_DAY_SESSION_JOIN } from "./lib/revenueDay.js";
+import {
+  buildTimestampDayFilter,
+  buildRevenueDayAndCreatedFilter,
+  preferredPayoutPeriod,
+  operationalExclusiveEndDate,
+  REVENUE_DAY_SESSION_JOIN,
+} from "./lib/revenueDay.js";
 import {
   ensureTableSessionsSchema,
   ensureSessionForOrder,
@@ -62,6 +75,9 @@ import {
   assertWaiterOwnsTable,
   isFloorWaiter,
   releaseTableClaimIfIdle,
+  closeStaleOpenSessionIfNeeded,
+  appendLivePendingSessionFilter,
+  fetchLivePendingOrderIds,
 } from "./lib/tableSessions.js";
 import {
   ensureProductPricingSchema,
@@ -250,10 +266,18 @@ function toSqlDateString(val) {
 
 /** Attribute LD order_items to a staff user (served_by = users.id, else order opener code). */
 const PAYROLL_LD_STAFF_SQL = "(oi.served_by = ? OR (oi.served_by IS NULL AND o.employee_id = ?))";
-/** LD lines on paid and open (pending) tabs count toward daily payroll. */
-const PAYROLL_LD_STATUS_SQL = "o.status IN ('pending','paid')";
+/**
+ * Paid LD always counts. Pending LD only counts while the table session is still open.
+ * Leftover pending lines on a closed/vacated table are excluded (they never appear in Product sales).
+ */
+const PAYROLL_LD_STATUS_SQL = `(
+  o.status = 'paid'
+  OR (o.status = 'pending' AND (ts.id IS NULL OR ts.closed_at IS NULL))
+)`;
 /** Complimentary LD does not earn commission/incentive. */
 const PAYROLL_LD_NON_COMP_SQL = "COALESCE(oi.is_complimentary, 0) = 0";
+/** Whole-order voids — used only in queries that already have a voided_at fallback. */
+const PAYROLL_LD_ORDER_NOT_VOID_SQL = "(o.voided_at IS NULL)";
 
 /** Floor areas shown in Dashboard/POS and payroll LD breakdown (excludes LD room). */
 const PAYROLL_FLOOR_AREAS_SQL = "'Lounge', 'Club'";
@@ -313,6 +337,7 @@ async function buildPayrollLdTableBreakdown(db, branchId, dateClause, dateParams
      ${REVENUE_DAY_SESSION_JOIN}
      WHERE o.branch_id = ? AND oi.department = 'LD'
        AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+       AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
        AND COALESCE(oi.is_voided,0) = 0
        AND ${PAYROLL_LD_NON_COMP_SQL}
        AND ${PAYROLL_LD_STAFF_SQL}
@@ -384,15 +409,21 @@ async function buildPayrollLdTableBreakdown(db, branchId, dateClause, dateParams
 async function reconcileTableVisitIds(db, branchId, tableId) {
   if (!tableId) return;
   try {
+    const session = await getOpenSession(db, branchId, tableId);
+    const live = appendLivePendingSessionFilter(session);
     const [r] = await db.execute(
-      `SELECT MIN(id) AS anchor FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL`,
-      [branchId, tableId]
+      `SELECT MIN(id) AS anchor FROM orders
+       WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}`,
+      [branchId, tableId, ...live.params]
     );
     const anchor = r[0]?.anchor != null ? Number(r[0].anchor) : null;
     if (anchor == null) return;
     await db.execute(
-      `UPDATE orders SET table_visit_id = ? WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL`,
-      [anchor, branchId, tableId]
+      `UPDATE orders SET table_visit_id = ?
+       WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}`,
+      [anchor, branchId, tableId, ...live.params]
     );
   } catch (e) {
     if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
@@ -1096,11 +1127,12 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
     dayStartHour != null
       ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
       : null;
-  const { sql: dateSql, params: dateParams } = buildRevenueDayFilter({
+  const { periodFrom, periodTo } = preferredPayoutPeriod(fromDate, toDate, startHour);
+  const { sql: dateSql, params: dateParams } = buildRevenueDayAndCreatedFilter({
     startHour,
     fromDate,
     toDate,
-    noSessionTsCol: "o.created_at",
+    noSessionTsCol: "o.updated_at",
     noSessionDateCol: "o.order_date",
   });
   // dateSql already includes leading AND; strip for WHERE-first usage after JOINs
@@ -1114,6 +1146,7 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
      ${REVENUE_DAY_SESSION_JOIN}
      WHERE o.branch_id = ? AND oi.department = 'LD'
        AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+       AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
        AND COALESCE(oi.is_voided,0) = 0
        AND ${PAYROLL_LD_NON_COMP_SQL}`,
     `SELECT COALESCE(SUM(oi.quantity),0) AS totalLd
@@ -1143,6 +1176,7 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
        ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+         AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
          AND COALESCE(oi.is_voided,0) = 0
          AND ${PAYROLL_LD_NON_COMP_SQL}
          AND ${PAYROLL_LD_STAFF_SQL}`,
@@ -1177,6 +1211,7 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
          ${REVENUE_DAY_SESSION_JOIN}
          WHERE o.branch_id = ? AND oi.department = 'LD'
            AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+           AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
            AND COALESCE(oi.is_voided,0) = 0
            AND ${PAYROLL_LD_NON_COMP_SQL}
            AND ${PAYROLL_LD_STAFF_SQL}
@@ -1204,8 +1239,10 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
     const incentives = branchIncentives + tablePay;
 
     const [existing] = await db.execute(
-      `SELECT id, incentives_breakdown, adjustments, deductions FROM payouts WHERE user_id = ? AND period_from = ? AND period_to = ?`,
-      [staff.id, fromDate, toDate]
+      `SELECT id, incentives_breakdown, adjustments, deductions FROM payouts
+       WHERE user_id = ? AND period_from = ? AND period_to = ?
+       ORDER BY id DESC LIMIT 1`,
+      [staff.id, periodFrom, periodTo]
     );
 
     const otherSum = (() => {
@@ -1228,7 +1265,7 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
       await db.execute(
         `INSERT INTO payouts (user_id, period_from, period_to, allowance, hours, commission, incentives, incentives_breakdown, total, status)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
-        [staff.id, fromDate, toDate, budget, 0, commission, incentives, JSON.stringify([]), total]
+        [staff.id, periodFrom, periodTo, budget, 0, commission, incentives, JSON.stringify([]), total]
       );
     }
 
@@ -1963,21 +2000,7 @@ app.get("/api/orders/:orderId/detail", requireAnyPermission("view_orders", "mana
        ORDER BY oi.id`,
       [numericId]
     );
-    res.json({
-      id: "ORD-" + order.id,
-      orderNumber: formatOrderDisplayNumber(order),
-      table: order.tableName,
-      area: order.area,
-      employee: order.employee || order.employee_id || "—",
-      subtotal: Number(order.subtotal),
-      discount: Number(order.discount ?? 0),
-      tax: Number(order.tax ?? 0),
-      total: Number(order.total),
-      status: order.status,
-      paymentMethod: order.payment_method ?? null,
-      createdAt: order.created_at,
-      updatedAt: order.updated_at,
-      items: items.map((i) => ({
+    const mappedItems = items.map((i) => ({
         id: String(i.id),
         name: i.name,
         quantity: Number(i.quantity),
@@ -1989,7 +2012,29 @@ app.get("/api/orders/:orderId/detail", requireAnyPermission("view_orders", "mana
         isComplimentary: !!i.is_complimentary,
         isVoided: !!i.is_voided,
         servedByName: i.servedByName ?? null,
-      })),
+      }));
+    const liveSubtotal = mappedItems
+      .filter((i) => !i.isVoided)
+      .reduce((s, i) => s + i.subtotal, 0);
+    const liveComplimentary = mappedItems
+      .filter((i) => !i.isVoided && i.isComplimentary)
+      .reduce((s, i) => s + i.subtotal, 0);
+    const liveChargeable = Math.max(0, liveSubtotal - liveComplimentary);
+    res.json({
+      id: "ORD-" + order.id,
+      orderNumber: formatOrderDisplayNumber(order),
+      table: order.tableName,
+      area: order.area,
+      employee: order.employee || order.employee_id || "—",
+      subtotal: liveSubtotal,
+      discount: Number(order.discount ?? 0),
+      tax: Number(order.tax ?? 0),
+      total: liveChargeable,
+      status: order.status,
+      paymentMethod: order.payment_method ?? null,
+      createdAt: order.created_at,
+      updatedAt: order.updated_at,
+      items: mappedItems,
     });
   } catch (err) {
     console.error("Order detail error:", err);
@@ -3006,19 +3051,7 @@ app.post("/api/tables/:tableId/bill-preview", requireAnyPermission("accept_payme
   try {
     const db = await getPool();
     const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-    let pending;
-    try {
-      [pending] = await db.execute(
-        "SELECT id, subtotal FROM orders WHERE table_id = ? AND status = 'pending' AND branch_id = ? AND voided_at IS NULL ORDER BY id",
-        [tableId, branchId]
-      );
-    } catch (e) {
-      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
-      [pending] = await db.execute(
-        "SELECT id, subtotal FROM orders WHERE table_id = ? AND status = 'pending' AND branch_id = ? ORDER BY id",
-        [tableId, branchId]
-      );
-    }
+    const pending = await fetchPendingOrdersForTable(db, tableId, branchId);
     if (!pending.length) {
       // Read-only preview: an empty/settled table is not an error, just a zero bill.
       return res.json({
@@ -3076,17 +3109,26 @@ app.post("/api/tables/:tableId/pay-all", requireAnyPermission("accept_payments",
     conn = await db.getConnection();
     await conn.beginTransaction();
     const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+    await closeStaleOpenSessionIfNeeded(conn, branchId, tableId);
+    const openSessForPay = await getOpenSession(conn, branchId, tableId);
+    const livePay = appendLivePendingSessionFilter(openSessForPay);
     let pending;
     try {
       [pending] = await conn.execute(
-        "SELECT id, order_number, subtotal, discount, tax, total, employee_id FROM orders WHERE table_id = ? AND status = 'pending' AND branch_id = ? AND voided_at IS NULL ORDER BY id FOR UPDATE",
-        [tableId, branchId]
+        `SELECT id, order_number, subtotal, discount, tax, total, employee_id FROM orders
+         WHERE table_id = ? AND status = 'pending' AND branch_id = ? AND voided_at IS NULL
+         ${livePay.sql}
+         ORDER BY id FOR UPDATE`,
+        [tableId, branchId, ...livePay.params]
       );
     } catch (e) {
       if (e.code === "ER_BAD_FIELD_ERROR") {
         [pending] = await conn.execute(
-          "SELECT id, order_number, subtotal, discount, tax, total, employee_id FROM orders WHERE table_id = ? AND status = 'pending' AND branch_id = ? ORDER BY id FOR UPDATE",
-          [tableId, branchId]
+          `SELECT id, order_number, subtotal, discount, tax, total, employee_id FROM orders
+           WHERE table_id = ? AND status = 'pending' AND branch_id = ?
+           ${livePay.sql}
+           ORDER BY id FOR UPDATE`,
+          [tableId, branchId, ...livePay.params]
         );
         pending = (pending || []).map((o) => ({ ...o, order_number: o.order_number ?? null }));
       } else throw e;
@@ -4551,12 +4593,12 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
               wu.name AS sessionWaiterName, wu.nickname AS sessionWaiterNickname
        FROM orders o 
        LEFT JOIN pos_tables t ON t.branch_id = o.branch_id AND t.id = o.table_id
-       LEFT JOIN users u ON u.employee_id = o.employee_id
+       LEFT JOIN users u ON u.employee_id = o.employee_id AND u.branch_id = o.branch_id
        LEFT JOIN table_sessions ts ON ts.id = o.session_id
-       LEFT JOIN users wu ON wu.employee_id = ts.waiter_id
+       LEFT JOIN users wu ON wu.employee_id = ts.waiter_id AND wu.branch_id = o.branch_id
        WHERE o.branch_id = ?`;
     const params = [branchId];
-    const { sql: dateSql, params: dateParams } = buildRevenueDayFilter({
+    const { sql: dateSql, params: dateParams } = buildRevenueDayAndCreatedFilter({
       startHour,
       fromDate,
       toDate,
@@ -4600,15 +4642,16 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
               NULL AS sessionWaiterName, NULL AS sessionWaiterNickname
        FROM orders o 
        LEFT JOIN pos_tables t ON t.branch_id = o.branch_id AND t.id = o.table_id
-       LEFT JOIN users u ON u.employee_id = o.employee_id
+       LEFT JOIN users u ON u.employee_id = o.employee_id AND u.branch_id = o.branch_id
        WHERE o.branch_id = ?`;
       const legacyParams = [branchId];
       let legacyDateSql = "";
       if (startHour != null && !isNaN(startHour)) {
         const hourPad = String(startHour).padStart(2, "0");
+        const endDate = operationalExclusiveEndDate(fromDate, toDate);
         legacyDateSql =
-          ` AND o.created_at >= CONCAT(?, ' ', ?, ':00:00') AND o.created_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00')`;
-        legacyParams.push(fromDate, hourPad, toDate, hourPad);
+          ` AND o.created_at >= CONCAT(?, ' ', ?, ':00:00') AND o.created_at < CONCAT(?, ' ', ?, ':00:00')`;
+        legacyParams.push(fromDate, hourPad, endDate, hourPad);
       } else {
         legacyDateSql = ` AND o.order_date BETWEEN ? AND ?`;
         legacyParams.push(fromDate, toDate);
@@ -4630,6 +4673,15 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
         orderBy;
       const [r] = await db.execute(sql, legacyParams);
       rows = r;
+    }
+    {
+      const seenOrderIds = new Set();
+      rows = (rows || []).filter((r) => {
+        const id = String(r.id);
+        if (seenOrderIds.has(id)) return false;
+        seenOrderIds.add(id);
+        return true;
+      });
     }
     const orderIds = rows.map((r) => r.id);
     const complimentaryMap = {};
@@ -4693,7 +4745,7 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
     assignSalesVisitGroupMeta(withoutSession);
 
     const formatTime = (value) =>
-      value ? new Date(value).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" }) : "—";
+      value ? new Date(value).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Manila" }) : "—";
 
     const list = rows.map((r) => {
       const rawTax = Number(r.tax || 0);
@@ -4726,7 +4778,11 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
         const inferred = round2(orderTotal - taxableBase - expectedService - rawTax);
         estimatedCardSurcharge = Math.max(0, inferred);
       }
-      const adjustedTotal = round2(orderTotal - (taxRatePct <= 0 ? rawTax : 0));
+      const liveTotal = round2(taxableBase + displayTax + expectedService + estimatedCardSurcharge);
+      const adjustedTotal = r.status === "pending"
+        ? liveTotal
+        : round2(orderTotal - (taxRatePct <= 0 ? rawTax : 0));
+      const displayTotal = r.status === "pending" || liveTotal < adjustedTotal - 0.009 ? liveTotal : adjustedTotal;
       const timeMs = r.time ? new Date(r.time).getTime() : 0;
       const sessionIdNum = r.sessionId != null && Number(r.sessionId) > 0 ? Number(r.sessionId) : null;
       const visitAnchor = sessionIdNum != null
@@ -4753,7 +4809,7 @@ app.get("/api/reports/sales", requireAnyPermission("view_reports"), async (req, 
         tax: displayTax,
         serviceCharge: expectedService,
         cardSurcharge: estimatedCardSurcharge,
-        total: adjustedTotal,
+        total: displayTotal,
         status: r.status,
         paymentMethod: r.paymentMethod || null,
         time: formatTime(r.time),
@@ -4922,7 +4978,7 @@ app.get("/api/reports/products", requireAnyPermission("view_reports"), async (re
     const params = [branchId];
     // Same revenue-day rule as Sales (session close → open → no-session fallback).
     // Paid-only: no-session fallback uses updated_at / order_date (bill-out day).
-    const { sql: dateSql, params: dateParams } = buildRevenueDayFilter({
+    const { sql: dateSql, params: dateParams } = buildRevenueDayAndCreatedFilter({
       startHour,
       fromDate,
       toDate,
@@ -4981,8 +5037,9 @@ app.get("/api/reports/products", requireAnyPermission("view_reports"), async (re
       let legacyDate = "";
       if (startHour != null && !isNaN(startHour)) {
         const hourPad = String(startHour).padStart(2, "0");
-        legacyDate = ` AND o.updated_at >= CONCAT(?, ' ', ?, ':00:00') AND o.updated_at < CONCAT(DATE_ADD(?, INTERVAL 1 DAY), ' ', ?, ':00:00')`;
-        legacyParams.push(fromDate, hourPad, toDate, hourPad);
+        const endDate = operationalExclusiveEndDate(fromDate, toDate);
+        legacyDate = ` AND o.updated_at >= CONCAT(?, ' ', ?, ':00:00') AND o.updated_at < CONCAT(?, ' ', ?, ':00:00')`;
+        legacyParams.push(fromDate, hourPad, endDate, hourPad);
       } else {
         legacyDate = ` AND o.order_date BETWEEN ? AND ?`;
         legacyParams.push(fromDate, toDate);
@@ -5325,14 +5382,15 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
     dayStartHour != null
       ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
       : null;
-  const { sql: dateSqlRaw, params: dateParams } = buildRevenueDayFilter({
+  const { sql: dateSqlRaw, params: dateParams } = buildRevenueDayAndCreatedFilter({
     startHour,
     fromDate,
     toDate,
-    noSessionTsCol: "o.created_at",
+    noSessionTsCol: "o.updated_at",
     noSessionDateCol: "o.order_date",
   });
   const dateClause = dateSqlRaw.replace(/^\s*AND\s*/, "");
+  const { periodFrom, periodTo } = preferredPayoutPeriod(fromDate, toDate, startHour);
   try {
     const db = await getPool();
     const [rows] = await db.execute(
@@ -5343,10 +5401,12 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
        approver.name AS approvedBy
        FROM payouts p
        JOIN users u ON u.id = p.user_id AND u.branch_id = ? AND u.active = 1
+       ${LATEST_PAYOUT_PER_USER_JOIN}
        LEFT JOIN users approver ON approver.id = p.approved_by
-       WHERE p.period_from >= ? AND p.period_to <= ? ORDER BY p.id`,
-      [branchId, fromDate, toDate]
+       ORDER BY u.name, p.id`,
+      [branchId, ...latestPayoutPerUserParams(branchId, periodFrom, periodTo, fromDate, toDate)]
     );
+    const payoutRows = dedupePayrollRows(rows);
     const parseBreakdown = (v) => {
       if (!v) return null;
       try { return Array.isArray(typeof v === "string" ? JSON.parse(v) : v) ? (typeof v === "string" ? JSON.parse(v) : v) : null; } catch (_) { return null; }
@@ -5362,6 +5422,7 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
        ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
          AND ${dateClause} AND o.status = 'paid'
+         AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
          AND COALESCE(oi.is_voided,0) = 0
          AND ${PAYROLL_LD_NON_COMP_SQL}
        GROUP BY oi.served_by, o.employee_id`,
@@ -5384,7 +5445,8 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
        JOIN orders o ON o.id = oi.order_id
        ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
-         AND ${dateClause} AND o.status IN ('pending','paid')
+         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+         AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
          AND COALESCE(oi.is_voided,0) = 0
          AND ${PAYROLL_LD_NON_COMP_SQL}
        GROUP BY oi.served_by, o.employee_id`,
@@ -5394,7 +5456,7 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
        JOIN orders o ON o.id = oi.order_id
        ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
-         AND ${dateClause} AND o.status IN ('pending','paid')
+         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
        GROUP BY oi.served_by, o.employee_id`,
       [branchId, ...dateParams]
     );
@@ -5402,21 +5464,24 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
     const ldQtyAggRows = await queryWithVoidFallback(
       db,
       `SELECT COALESCE(SUM(CASE WHEN o.status = 'paid' THEN oi.quantity ELSE 0 END), 0) AS totalLdQtyPaid,
+              COALESCE(SUM(CASE WHEN o.status = 'pending' THEN oi.quantity ELSE 0 END), 0) AS totalLdQtyOpen,
               COALESCE(SUM(oi.quantity), 0) AS totalLdQtyRealtime
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
-         AND ${dateClause} AND o.status IN ('pending','paid')
+         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+         AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
          AND COALESCE(oi.is_voided,0) = 0
          AND ${PAYROLL_LD_NON_COMP_SQL}`,
       `SELECT COALESCE(SUM(CASE WHEN o.status = 'paid' THEN oi.quantity ELSE 0 END), 0) AS totalLdQtyPaid,
+              COALESCE(SUM(CASE WHEN o.status = 'pending' THEN oi.quantity ELSE 0 END), 0) AS totalLdQtyOpen,
               COALESCE(SUM(oi.quantity), 0) AS totalLdQtyRealtime
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        ${REVENUE_DAY_SESSION_JOIN}
        WHERE o.branch_id = ? AND oi.department = 'LD'
-         AND ${dateClause} AND o.status IN ('pending','paid')`,
+         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}`,
       [branchId, ...dateParams]
     );
     const ldCountMap = {};
@@ -5457,15 +5522,61 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
     addLdMaps(ldCountRealtimeRows, "realtime");
     const agg0 = (ldQtyAggRows && ldQtyAggRows[0]) || {};
     const totalLdQtyPaid = pickNum(agg0, "totalLdQtyPaid", "totalldqtypaid");
+    const totalLdQtyOpen = pickNum(agg0, "totalLdQtyOpen", "totalldqtyopen");
     const totalLdQtyRealtime = pickNum(agg0, "totalLdQtyRealtime", "totalldqtyrealtime");
-    const userIds = rows.map((r) => r.userId).filter(Boolean);
+    const openLdTableRows = await queryWithVoidFallback(
+      db,
+      `SELECT COALESCE(o.table_id, '—') AS tableId, SUM(oi.quantity) AS ldCount
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
+       WHERE o.branch_id = ? AND oi.department = 'LD'
+         AND ${dateClause} AND o.status = 'pending' AND (ts.id IS NULL OR ts.closed_at IS NULL)
+         AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
+         AND COALESCE(oi.is_voided,0) = 0
+         AND ${PAYROLL_LD_NON_COMP_SQL}
+       GROUP BY o.table_id
+       HAVING SUM(oi.quantity) > 0`,
+      `SELECT COALESCE(o.table_id, '—') AS tableId, SUM(oi.quantity) AS ldCount
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       ${REVENUE_DAY_SESSION_JOIN}
+       WHERE o.branch_id = ? AND oi.department = 'LD'
+         AND ${dateClause} AND o.status = 'pending' AND (ts.id IS NULL OR ts.closed_at IS NULL)
+       GROUP BY o.table_id
+       HAVING SUM(oi.quantity) > 0`,
+      [branchId, ...dateParams]
+    );
+    const openLdTables = (openLdTableRows || [])
+      .map((r) => ({
+        tableId: String(r.tableId ?? r.tableid ?? "—"),
+        ldCount: pickNum(r, "ldCount", "ldcount"),
+      }))
+      .filter((t) => t.ldCount > 0);
+    try {
+      const [posRows] = await db.execute(`SELECT id, name FROM pos_tables WHERE branch_id = ?`, [branchId]);
+      for (const t of openLdTables) {
+        const resolved = resolvePosTableForOrderTableId(t.tableId, posRows);
+        t.tableCode = resolved?.name || t.tableId;
+      }
+    } catch {
+      for (const t of openLdTables) t.tableCode = t.tableId;
+    }
+    const userIds = payoutRows.map((r) => r.userId).filter(Boolean);
     let timeInMap = {};
     if (userIds.length > 0) {
       const placeholders = userIds.map(() => "?").join(",");
+      const { sql: attSqlRaw, params: attParams } = buildTimestampDayFilter({
+        col: "a.time_in",
+        startHour,
+        fromDate,
+        toDate,
+      });
+      const attClause = attSqlRaw.replace(/^\s*AND\s*/, "");
       const [attRows] = await db.execute(
-        `SELECT user_id AS userId, MIN(time_in) AS timeIn FROM attendance
-         WHERE work_date BETWEEN ? AND ? AND user_id IN (${placeholders}) GROUP BY user_id`,
-        [fromDate, toDate, ...userIds]
+        `SELECT a.user_id AS userId, MIN(a.time_in) AS timeIn FROM attendance a
+         WHERE ${attClause} AND a.user_id IN (${placeholders}) GROUP BY a.user_id`,
+        [...attParams, ...userIds]
       ).catch(() => []);
       for (const a of (attRows || [])) {
         if (a.userId) timeInMap[String(a.userId)] = a.timeIn;
@@ -5489,7 +5600,7 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
         userId: String(r.userId),
         employeeId: r.employeeId,
         name: r.name,
-        timeIn: timeIn ? new Date(timeIn).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit", hour12: true }) : null,
+        timeIn: timeIn ? new Date(timeIn).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Manila" }) : null,
         defaultAllowance: Number(r.defaultAllowance ?? 0),
         perHour: 0,
         allowance: budget,
@@ -5512,9 +5623,11 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
       };
     };
     res.json({
-      rows: rows.map(mapRow),
+      rows: payoutRows.map(mapRow),
       totalLdQtyPaid,
+      totalLdQtyOpen,
       totalLdQtyRealtime,
+      openLdTables,
     });
   } catch (err) {
     if (err.code === "ER_BAD_FIELD_ERROR") {
@@ -5524,9 +5637,11 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
         const [rows] = await db.execute(
           `SELECT p.id, p.user_id AS userId, u.employee_id AS employeeId, u.name, u.allowance AS defaultAllowance, u.hourly AS perHour,
            p.allowance, p.hours, p.commission, p.incentives, p.total, p.status
-           FROM payouts p JOIN users u ON u.id = p.user_id AND u.branch_id = ? AND u.active = 1
-           WHERE p.period_from >= ? AND p.period_to <= ? ORDER BY p.id`,
-          [branchId, fromDate, toDate]
+           FROM payouts p
+           JOIN users u ON u.id = p.user_id AND u.branch_id = ? AND u.active = 1
+           ${LATEST_PAYOUT_PER_USER_JOIN}
+           ORDER BY u.name, p.id`,
+          [branchId, ...latestPayoutPerUserParams(branchId, periodFrom, periodTo, fromDate, toDate)]
         );
         return res.json({
           rows: rows.map((r) => ({
@@ -5538,7 +5653,9 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
             total: Number(r.total), netPayout: Number(r.allowance) + Number(r.commission) + Number(r.incentives ?? 0), status: r.status, approvedBy: null,
           })),
           totalLdQtyPaid: 0,
+          totalLdQtyOpen: 0,
           totalLdQtyRealtime: 0,
+          openLdTables: [],
         });
       } catch (e) {
         console.error("Payroll report error:", e);
@@ -5718,11 +5835,11 @@ app.get("/api/reports/payroll/:id/ld-by-table", requireAnyPermission("view_payro
       dayStartHour != null
         ? Math.min(23, Math.max(0, parseInt(String(dayStartHour), 10) || 0))
         : null;
-    const { sql: dateSqlRaw, params: dateParams } = buildRevenueDayFilter({
+    const { sql: dateSqlRaw, params: dateParams } = buildRevenueDayAndCreatedFilter({
       startHour,
       fromDate,
       toDate,
-      noSessionTsCol: "o.created_at",
+      noSessionTsCol: "o.updated_at",
       noSessionDateCol: "o.order_date",
     });
     const dateClause = dateSqlRaw.replace(/^\s*AND\s*/, "");
@@ -5733,10 +5850,11 @@ app.get("/api/reports/payroll/:id/ld-by-table", requireAnyPermission("view_payro
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        ${REVENUE_DAY_SESSION_JOIN}
-       WHERE o.branch_id = ? AND oi.department = 'LD'
-         AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
-         AND COALESCE(oi.is_voided,0) = 0
-         AND ${PAYROLL_LD_NON_COMP_SQL}`,
+     WHERE o.branch_id = ? AND oi.department = 'LD'
+       AND ${dateClause} AND ${PAYROLL_LD_STATUS_SQL}
+       AND ${PAYROLL_LD_ORDER_NOT_VOID_SQL}
+       AND COALESCE(oi.is_voided,0) = 0
+       AND ${PAYROLL_LD_NON_COMP_SQL}`,
       `SELECT COALESCE(SUM(oi.quantity),0) AS totalLd
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
@@ -6756,11 +6874,8 @@ app.put("/api/split-payments/:id/pay", requireAnyPermission("split_bill", "accep
         if (orderInfo[0]?.table_id) {
           const tableId = orderInfo[0].table_id;
           const branchId = String(orderInfo[0].branch_id || "1");
-          const [tablePending] = await db.execute(
-            "SELECT COUNT(*) AS cnt FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending'",
-            [branchId, tableId]
-          );
-          if (Number(tablePending[0]?.cnt || 0) === 0) {
+          const tablePending = await fetchLivePendingOrderIds(db, branchId, tableId);
+          if (tablePending.length === 0) {
             await db.execute(
               "UPDATE pos_tables SET status = 'available', current_order_id = NULL WHERE branch_id = ? AND id = ?",
               [branchId, tableId]
@@ -6814,24 +6929,19 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
       return res.status(400).json({ error: "Source and target tables must be different" });
     }
 
-    const [targetPending] = await db.execute(
-      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id`,
-      [branchId, toTable]
-    );
+    const targetPending = await fetchLivePendingOrderIds(db, branchId, toTable);
 
     // Occupied target → one-step swap (no temp table / punch-merge-void workaround)
     if (targetPending.length > 0) {
-      const [sourcePending] = await db.execute(
-        `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id`,
-        [branchId, fromTable]
-      );
+      const sourcePending = await fetchLivePendingOrderIds(db, branchId, fromTable);
       if (sourcePending.length === 0) {
         return res.status(400).json({ error: "Source table has no active order to swap" });
       }
 
-      const sourceIds = sourcePending.map((r) => r.id);
-      const targetIds = targetPending.map((r) => r.id);
+      const sourceIds = sourcePending;
+      const targetIds = targetPending;
       const swapReason = reason?.trim() ? `swap: ${reason.trim()}` : "swap";
+      const idPlaceholders = [...sourceIds, ...targetIds].map(() => "?").join(",");
 
       // Atomic swap — CASE uses pre-update values, so no temp table_id (VARCHAR(16) safe)
       await db.execute(
@@ -6841,8 +6951,8 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
            WHEN ? THEN ?
            ELSE table_id
          END
-         WHERE branch_id = ? AND status = 'pending' AND table_id IN (?, ?)`,
-        [fromTable, toTable, toTable, fromTable, branchId, fromTable, toTable]
+         WHERE branch_id = ? AND status = 'pending' AND id IN (${idPlaceholders})`,
+        [fromTable, toTable, toTable, fromTable, branchId, ...sourceIds, ...targetIds]
       );
 
       for (const oid of sourceIds) {
@@ -6889,11 +6999,7 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
 
     let orderIdsToMove = [];
     if (transferAll && fromTable && toTable) {
-      const [sourceOrders] = await db.execute(
-        `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id`,
-        [branchId, fromTable]
-      );
-      orderIdsToMove = sourceOrders.map((r) => r.id);
+      orderIdsToMove = await fetchLivePendingOrderIds(db, branchId, fromTable);
     } else if (orderId && fromTable && toTable) {
       orderIdsToMove = [orderId];
     }
@@ -6911,20 +7017,8 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
     }
 
     // Vacate source only when no pending orders remain there
-    let remainingSource;
-    try {
-      [remainingSource] = await db.execute(
-        `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL LIMIT 1`,
-        [branchId, fromTable]
-      );
-    } catch (e) {
-      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
-      [remainingSource] = await db.execute(
-        `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' LIMIT 1`,
-        [branchId, fromTable]
-      );
-    }
-    const fullTransfer = !remainingSource.length;
+    const remainingSource = await fetchLivePendingOrderIds(db, branchId, fromTable);
+    const fullTransfer = remainingSource.length === 0;
     const firstOrderId = orderIdsToMove[0];
 
     try {
@@ -6938,7 +7032,7 @@ app.post("/api/tables/transfer", requireAnyPermission("transfer_table_orders"), 
       } else {
         await db.execute(
           `UPDATE pos_tables SET current_order_id = ? WHERE branch_id = ? AND id = ?`,
-          [remainingSource[0].id, branchId, fromTable]
+          [remainingSource[0], branchId, fromTable]
         );
         await reconcileTableVisitIds(db, branchId, fromTable);
         // Partial transfer: attach moved orders to target session (or open one)
@@ -7020,16 +7114,13 @@ app.post("/api/tables/merge", requireAnyPermission("transfer_table_orders"), asy
     await db.execute(`DELETE FROM orders WHERE id = ?`, [sourceOrderId]);
     
     // Move ALL remaining pending orders from source table to target table (so source table is fully cleared)
-    const [remaining] = await db.execute(
-      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id`,
-      [branchId, sourceTableId]
-    );
-    for (const row of remaining) {
-      await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [targetTableId, row.id]);
+    const remaining = await fetchLivePendingOrderIds(db, branchId, sourceTableId);
+    for (const oid of remaining) {
+      await db.execute(`UPDATE orders SET table_id = ? WHERE id = ?`, [targetTableId, oid]);
       await db.execute(`
         INSERT INTO table_transfers (order_id, from_table, to_table, transfer_type, transferred_by, reason)
         VALUES (?, ?, ?, 'move', ?, ?)
-      `, [row.id, sourceTableId, targetTableId, transferredBy || null, reason || null]);
+      `, [oid, sourceTableId, targetTableId, transferredBy || null, reason || null]);
     }
     
     // Only now set source table to available (no more orders there)
@@ -7038,14 +7129,11 @@ app.post("/api/tables/merge", requireAnyPermission("transfer_table_orders"), asy
       [branchId, sourceTableId]
     );
     // Ensure target table is occupied (use first order id we have)
-    const [targetOrders] = await db.execute(
-      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ORDER BY id LIMIT 1`,
-      [branchId, targetTableId]
-    );
+    const targetOrders = await fetchLivePendingOrderIds(db, branchId, targetTableId);
     if (targetOrders.length > 0) {
       await db.execute(
         `UPDATE pos_tables SET status = 'occupied', current_order_id = ? WHERE branch_id = ? AND id = ?`,
-        [targetOrders[0].id, branchId, targetTableId]
+        [targetOrders[0], branchId, targetTableId]
       );
     }
     
@@ -7057,9 +7145,13 @@ app.post("/api/tables/merge", requireAnyPermission("transfer_table_orders"), asy
     try {
       const sessionId = await mergeSessions(db, branchId, sourceTableId, targetTableId);
       if (sessionId) {
+        const targetSess = await getOpenSession(db, branchId, targetTableId);
+        const liveMerge = appendLivePendingSessionFilter(targetSess || { id: sessionId, opened_at: new Date() });
         await db.execute(
-          `UPDATE orders SET session_id = ? WHERE branch_id = ? AND table_id = ? AND status = 'pending'`,
-          [sessionId, branchId, targetTableId]
+          `UPDATE orders SET session_id = ?
+           WHERE branch_id = ? AND table_id = ? AND status = 'pending'
+           ${liveMerge.sql}`,
+          [sessionId, branchId, targetTableId, ...liveMerge.params]
         );
       }
       await reconcileTableVisitIds(db, branchId, targetTableId);
@@ -7197,6 +7289,7 @@ app.put("/api/settings", requireAnyPermission("manage_settings"), async (req, re
         `[Migration] product prices/stock: ${priceMig.priceRowsCreated} price rows, ${priceMig.skuLinesBackfilled} SKU lines, ${stockMig.stockRowsCreated} stock rows.`
       );
     }
+    await ensurePayoutsSchema(db);
     await ensureVoidLogSchema(db);
     const voidMig = await backfillLegacyVoids(db);
     if (voidMig.inserted > 0) {

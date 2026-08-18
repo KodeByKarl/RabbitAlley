@@ -269,7 +269,8 @@ CREATE TABLE IF NOT EXISTS payouts (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY (approved_by) REFERENCES users(id) ON DELETE SET NULL,
-  KEY idx_payouts_period (period_from, period_to)
+  KEY idx_payouts_period (period_from, period_to),
+  UNIQUE KEY uk_payouts_user_period (user_id, period_from, period_to)
 );
 
 -- ============================================================================

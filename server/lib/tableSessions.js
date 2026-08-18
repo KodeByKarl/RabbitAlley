@@ -5,6 +5,9 @@
 
 const LEGACY_GAP_MS = 4 * 60 * 60 * 1000;
 const PAID_GAP_MS = 60 * 1000;
+/** An open session with no activity this long is a leftover occupancy (not today's seating). */
+export const STALE_SESSION_MS = 20 * 60 * 60 * 1000;
+export const LIVE_PENDING_HOURS = 20;
 
 export async function ensureTableSessionsSchema(db) {
   await db.execute(`
@@ -54,6 +57,79 @@ export async function getOpenSession(db, branchId, tableId) {
   return rows[0] || null;
 }
 
+/**
+ * Pending lines that belong to the current seating only.
+ * Last-month leftovers that were vacuumed onto a new session are excluded
+ * because their created_at is before this session opened.
+ */
+export function appendLivePendingSessionFilter(session) {
+  if (session) {
+    return {
+      sql: ` AND (
+        (session_id = ? AND created_at >= GREATEST(DATE_SUB(?, INTERVAL 1 HOUR), DATE_SUB(NOW(), INTERVAL ${LIVE_PENDING_HOURS} HOUR)))
+        OR ((session_id IS NULL OR session_id = 0) AND created_at >= DATE_SUB(NOW(), INTERVAL ${LIVE_PENDING_HOURS} HOUR))
+      )`,
+      params: [Number(session.id), session.opened_at],
+    };
+  }
+  return {
+    sql: ` AND (session_id IS NULL OR session_id = 0) AND created_at >= DATE_SUB(NOW(), INTERVAL ${LIVE_PENDING_HOURS} HOUR)`,
+    params: [],
+  };
+}
+
+/** Pending order ids for the current seating only (excludes leftover tabs from earlier nights). */
+export async function fetchLivePendingOrderIds(db, branchId, tableId) {
+  await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
+  const session = await getOpenSession(db, branchId, tableId);
+  const live = appendLivePendingSessionFilter(session);
+  try {
+    const [rows] = await db.execute(
+      `SELECT id FROM orders
+       WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}
+       ORDER BY id`,
+      [branchId, tableId, ...live.params]
+    );
+    return (rows || []).map((r) => r.id);
+  } catch (e) {
+    if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+    const [rows] = await db.execute(
+      `SELECT id FROM orders
+       WHERE branch_id = ? AND table_id = ? AND status = 'pending'
+       ${live.sql}
+       ORDER BY id`,
+      [branchId, tableId, ...live.params]
+    );
+    return (rows || []).map((r) => r.id);
+  }
+}
+
+export async function closeStaleOpenSessionIfNeeded(db, branchId, tableId, { maxAgeMs = STALE_SESSION_MS } = {}) {
+  const session = await getOpenSession(db, branchId, tableId);
+  if (!session) return { closed: false, session: null };
+  let lastMs = toMs(session.opened_at);
+  try {
+    const [rows] = await db.execute(
+      `SELECT MAX(created_at) AS lastAt FROM orders WHERE session_id = ?`,
+      [session.id]
+    );
+    const activity = toMs(rows[0]?.lastAt);
+    if (activity) lastMs = Math.max(lastMs, activity);
+  } catch {
+    // orders.session_id may be missing on very old DBs
+  }
+  if (Date.now() - lastMs < maxAgeMs) {
+    return { closed: false, session };
+  }
+  await closeSession(db, session.id, { closedBy: "system:stale-session" });
+  await db.execute(
+    `UPDATE pos_tables SET status = 'available', current_order_id = NULL WHERE branch_id = ? AND id = ?`,
+    [branchId, tableId]
+  );
+  return { closed: true, session: null };
+}
+
 function normalizeEmployeeId(employeeId) {
   return String(employeeId || "").trim().toUpperCase();
 }
@@ -90,6 +166,7 @@ export async function claimTableForWaiter(db, branchId, tableId, employeeId) {
     throw err;
   }
 
+  await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
   const session = await getOpenSession(db, branchId, tableId);
   if (session) {
     const owner = normalizeEmployeeId(session.waiter_id);
@@ -102,21 +179,24 @@ export async function claimTableForWaiter(db, branchId, tableId, employeeId) {
     return Number(session.id);
   }
 
+  const live = appendLivePendingSessionFilter(null);
   let pending;
   try {
     [pending] = await db.execute(
       `SELECT employee_id FROM orders
        WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}
        ORDER BY id LIMIT 1`,
-      [branchId, tableId]
+      [branchId, tableId, ...live.params]
     );
   } catch (e) {
     if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
     [pending] = await db.execute(
       `SELECT employee_id FROM orders
        WHERE branch_id = ? AND table_id = ? AND status = 'pending'
+       ${live.sql}
        ORDER BY id LIMIT 1`,
-      [branchId, tableId]
+      [branchId, tableId, ...live.params]
     );
   }
   if (pending.length) {
@@ -138,6 +218,7 @@ export async function assertWaiterOwnsTable(db, branchId, tableId, employeeId) {
     throw err;
   }
 
+  await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
   const session = await getOpenSession(db, branchId, tableId);
   if (session) {
     const owner = normalizeEmployeeId(session.waiter_id);
@@ -147,19 +228,21 @@ export async function assertWaiterOwnsTable(db, branchId, tableId, employeeId) {
     return;
   }
 
+  const live = appendLivePendingSessionFilter(null);
   let pending;
   try {
     [pending] = await db.execute(
       `SELECT employee_id FROM orders
        WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}
        LIMIT 1`,
-      [branchId, tableId]
+      [branchId, tableId, ...live.params]
     );
   } catch (e) {
     if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
     [pending] = await db.execute(
-      `SELECT employee_id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' LIMIT 1`,
-      [branchId, tableId]
+      `SELECT employee_id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ${live.sql} LIMIT 1`,
+      [branchId, tableId, ...live.params]
     );
   }
   if (pending.length) {
@@ -191,19 +274,21 @@ export async function releaseTableClaimIfIdle(db, branchId, tableId, employeeId)
   const owner = normalizeEmployeeId(session.waiter_id);
   if (owner && owner !== emp) return { released: false };
 
+  const live = appendLivePendingSessionFilter(session);
   let pending;
   try {
     [pending] = await db.execute(
       `SELECT id FROM orders
        WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}
        LIMIT 1`,
-      [branchId, tableId]
+      [branchId, tableId, ...live.params]
     );
   } catch (e) {
     if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
     [pending] = await db.execute(
-      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' LIMIT 1`,
-      [branchId, tableId]
+      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ${live.sql} LIMIT 1`,
+      [branchId, tableId, ...live.params]
     );
   }
   if (pending.length) return { released: false };
@@ -252,6 +337,7 @@ export async function attachOrderToSession(db, orderId, sessionId, visitAnchorOr
 export async function ensureSessionForOrder(db, { branchId, tableId, orderId, waiterId, isFreshSeating: _isFreshSeating }) {
   if (!tableId) return null;
 
+  await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
   const session = await getOpenSession(db, branchId, tableId);
 
   let sessionId;
@@ -265,23 +351,37 @@ export async function ensureSessionForOrder(db, { branchId, tableId, orderId, wa
       await db.execute(`UPDATE table_sessions SET waiter_id = ? WHERE id = ?`, [waiterId, sessionId]);
     }
     const [anchorRows] = await db.execute(
-      `SELECT MIN(id) AS anchor FROM orders WHERE session_id = ? AND voided_at IS NULL`,
-      [sessionId]
+      `SELECT MIN(id) AS anchor FROM orders
+       WHERE session_id = ? AND voided_at IS NULL
+         AND created_at >= GREATEST(DATE_SUB(?, INTERVAL 1 HOUR), DATE_SUB(NOW(), INTERVAL ${LIVE_PENDING_HOURS} HOUR))`,
+      [sessionId, session.opened_at]
     );
     visitAnchor = anchorRows[0]?.anchor != null ? Number(anchorRows[0].anchor) : orderId;
   }
 
   await attachOrderToSession(db, orderId, sessionId, visitAnchor);
 
-  // Keep all non-voided pending on this session sharing the same visit anchor
+  // Keep visit id in sync for this seating only — never pull leftover pending from other nights.
   try {
     await db.execute(
-      `UPDATE orders SET table_visit_id = ?, session_id = ?
-       WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL`,
-      [visitAnchor, sessionId, branchId, tableId]
+      `UPDATE orders SET table_visit_id = ?
+       WHERE session_id = ? AND status = 'pending' AND voided_at IS NULL
+         AND created_at >= DATE_SUB((SELECT opened_at FROM table_sessions WHERE id = ?), INTERVAL 1 HOUR)`,
+      [visitAnchor, sessionId, sessionId]
     );
   } catch (e) {
-    if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+    if (e.code === "ER_BAD_FIELD_ERROR") {
+      try {
+        await db.execute(
+          `UPDATE orders SET table_visit_id = ? WHERE session_id = ? AND status = 'pending'`,
+          [visitAnchor, sessionId]
+        );
+      } catch (e2) {
+        if (e2.code !== "ER_BAD_FIELD_ERROR") throw e2;
+      }
+    } else if (e.code !== "ER_NO_SUCH_TABLE") {
+      throw e;
+    }
   }
 
   return sessionId;
@@ -314,19 +414,22 @@ export async function closeOpenSessionForTable(db, branchId, tableId, { closedBy
  */
 export async function vacateTableIfIdle(db, branchId, tableId, { closedBy = null } = {}) {
   if (!tableId) return false;
+  const session = await getOpenSession(db, branchId, tableId);
+  const live = appendLivePendingSessionFilter(session);
   let pending;
   try {
     [pending] = await db.execute(
       `SELECT id FROM orders
        WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+       ${live.sql}
        LIMIT 1`,
-      [branchId, tableId]
+      [branchId, tableId, ...live.params]
     );
   } catch (e) {
     if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
     [pending] = await db.execute(
-      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' LIMIT 1`,
-      [branchId, tableId]
+      `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ${live.sql} LIMIT 1`,
+      [branchId, tableId, ...live.params]
     );
   }
   if (pending.length) return false;
@@ -348,19 +451,25 @@ export async function transferOpenSession(db, branchId, fromTable, toTable) {
   const target = await getOpenSession(db, branchId, toTable);
 
   if (source && !target) {
+    const liveSource = appendLivePendingSessionFilter(source);
     await db.execute(`UPDATE table_sessions SET table_id = ? WHERE id = ?`, [toTable, source.id]);
     await db.execute(
-      `UPDATE orders SET table_id = ? WHERE branch_id = ? AND session_id = ? AND status = 'pending'`,
-      [toTable, branchId, source.id]
+      `UPDATE orders SET table_id = ?
+       WHERE branch_id = ? AND session_id = ? AND status = 'pending'
+       ${liveSource.sql}`,
+      [toTable, branchId, source.id, ...liveSource.params]
     );
     return Number(source.id);
   }
 
   if (source && target) {
+    const liveSource = appendLivePendingSessionFilter(source);
     // Attach source orders to target session, close source
     await db.execute(
-      `UPDATE orders SET session_id = ?, table_id = ? WHERE branch_id = ? AND session_id = ? AND status = 'pending'`,
-      [target.id, toTable, branchId, source.id]
+      `UPDATE orders SET session_id = ?, table_id = ?
+       WHERE branch_id = ? AND session_id = ? AND status = 'pending'
+       ${liveSource.sql}`,
+      [target.id, toTable, branchId, source.id, ...liveSource.params]
     );
     await closeSession(db, source.id, { closedBy: "system:transfer" });
     return Number(target.id);
@@ -370,12 +479,14 @@ export async function transferOpenSession(db, branchId, fromTable, toTable) {
     return Number(target.id);
   }
 
-  // No sessions — open one on target for any pending orders there
+  // No sessions — open one on target for this seating's pending only
+  const liveTarget = appendLivePendingSessionFilter(null);
   const [pending] = await db.execute(
     `SELECT id, employee_id FROM orders
      WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+     ${liveTarget.sql}
      ORDER BY id`,
-    [branchId, toTable]
+    [branchId, toTable, ...liveTarget.params]
   );
   if (!pending.length) return null;
   const sessionId = await openSession(db, {
@@ -441,9 +552,12 @@ export async function mergeSessions(db, branchId, sourceTableId, targetTableId) 
   }
 
   if (source && Number(source.id) !== Number(target.id)) {
+    const liveSource = appendLivePendingSessionFilter(source);
     await db.execute(
-      `UPDATE orders SET session_id = ? WHERE session_id = ?`,
-      [target.id, source.id]
+      `UPDATE orders SET session_id = ?
+       WHERE session_id = ? AND status = 'pending'
+       ${liveSource.sql}`,
+      [target.id, source.id, ...liveSource.params]
     );
     await closeSession(db, source.id, { closedBy: "system:merge" });
   }

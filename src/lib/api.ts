@@ -735,7 +735,7 @@ export const api = {
       };
       return fetchApi<
         | PayrollRowApi[]
-        | { rows: PayrollRowApi[]; totalLdQtyPaid?: number; totalLdQtyRealtime?: number }
+        | { rows: PayrollRowApi[]; totalLdQtyPaid?: number; totalLdQtyOpen?: number; totalLdQtyRealtime?: number; openLdTables?: Array<{ tableId: string; tableCode?: string; ldCount: number }> }
       >("/api/reports/payroll?" + q.toString());
     },
     updatePayout: (id: string, body: {

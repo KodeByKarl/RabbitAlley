@@ -571,7 +571,16 @@ export default function Reports() {
   const [voidPrintOpen, setVoidPrintOpen] = useState(false);
   const [voidPrintStep, setVoidPrintStep] = useState<"preparing" | "printing" | "done">("preparing");
   const [payroll, setPayroll] = useState<PayrollRow[]>([]);
-  const [payrollSummary, setPayrollSummary] = useState({ totalEmployees: 0, totalPayout: 0, totalIncentives: 0, totalDeductions: 0, totalLd: 0 });
+  const [payrollSummary, setPayrollSummary] = useState({
+    totalEmployees: 0,
+    totalPayout: 0,
+    totalIncentives: 0,
+    totalDeductions: 0,
+    totalLd: 0,
+    totalLdPaid: 0,
+    totalLdOpen: 0,
+    openLdTables: [] as Array<{ tableId: string; tableCode?: string; ldCount: number }>,
+  });
   const [payrollSearch, setPayrollSearch] = useState("");
   const [payrollStatusFilter, setPayrollStatusFilter] = useState("All");
   const [payrollSortBy, setPayrollSortBy] = useState<"name" | "netPayout" | "timeIn">("name");
@@ -613,8 +622,11 @@ export default function Reports() {
         totalIncentives: acc.totalIncentives + row.incentives,
         totalDeductions: acc.totalDeductions + row.deductions,
         totalLd: acc.totalLd + (row.ldCountRealtime ?? row.ldCount ?? 0),
+        totalLdPaid: acc.totalLdPaid + (row.ldCount ?? 0),
+        totalLdOpen: acc.totalLdOpen,
+        openLdTables: acc.openLdTables,
       }),
-      { totalEmployees: 0, totalPayout: 0, totalIncentives: 0, totalDeductions: 0, totalLd: 0 }
+      { totalEmployees: 0, totalPayout: 0, totalIncentives: 0, totalDeductions: 0, totalLd: 0, totalLdPaid: 0, totalLdOpen: 0, openLdTables: payrollSummary.openLdTables }
     );
   }, [payrollSearch, payrollStatusFilter, payrollSummary, filteredPayroll]);
   const [loadingSales, setLoadingSales] = useState(false);
@@ -928,7 +940,18 @@ export default function Reports() {
       const serverTotalLdRealtime = Array.isArray(rawPayroll)
         ? null
         : (typeof rawPayroll.totalLdQtyRealtime === "number" ? rawPayroll.totalLdQtyRealtime : null);
-      const mappedPayroll = list.map((p) => {
+      const serverTotalLdPaid = Array.isArray(rawPayroll)
+        ? null
+        : (typeof rawPayroll.totalLdQtyPaid === "number" ? rawPayroll.totalLdQtyPaid : null);
+      const serverTotalLdOpen = Array.isArray(rawPayroll)
+        ? null
+        : (typeof rawPayroll.totalLdQtyOpen === "number" ? rawPayroll.totalLdQtyOpen : null);
+      const serverOpenLdTables = Array.isArray(rawPayroll) ? [] : (rawPayroll.openLdTables ?? []);
+      const seenEmployees = new Set<string>();
+      const mappedPayroll = list.flatMap((p) => {
+        const empKey = String(p.employeeId || "").trim().toUpperCase() || String(p.id);
+        if (seenEmployees.has(empKey)) return [];
+        seenEmployees.add(empKey);
         const incB = (p as { incentivesBreakdown?: BreakdownItem[] }).incentivesBreakdown ?? null;
         const otherInc = Array.isArray(incB) ? incB.reduce((s, x) => s + (x.amount ?? 0), 0) : 0;
         const budget = Number(p.allowance ?? 0);
@@ -942,7 +965,7 @@ export default function Reports() {
           typeof (p as { netPayout?: number }).netPayout === "number"
             ? Number((p as { netPayout?: number }).netPayout)
             : budget + commission + incentives + otherInc + adjustments - deductions;
-        return {
+        return [{
           id: p.id,
           employeeId: p.employeeId ?? "",
           name: p.name,
@@ -961,7 +984,7 @@ export default function Reports() {
           netPayout,
           status: p.status ?? "draft",
           approvedBy: p.approvedBy ?? null,
-        };
+        }];
       });
       setPayroll(mappedPayroll);
       const summary = mappedPayroll.reduce(
@@ -973,13 +996,32 @@ export default function Reports() {
             totalIncentives: acc.totalIncentives + row.incentives,
             totalDeductions: acc.totalDeductions + row.deductions,
             totalLd: acc.totalLd + (row.ldCountRealtime ?? row.ldCount ?? 0),
+            totalLdPaid: acc.totalLdPaid + (row.ldCount ?? 0),
+            totalLdOpen: acc.totalLdOpen,
+            openLdTables: acc.openLdTables,
           };
         },
-        { totalEmployees: 0, totalPayout: 0, totalIncentives: 0, totalDeductions: 0, totalLd: 0 }
+        {
+          totalEmployees: 0,
+          totalPayout: 0,
+          totalIncentives: 0,
+          totalDeductions: 0,
+          totalLd: 0,
+          totalLdPaid: 0,
+          totalLdOpen: 0,
+          openLdTables: [] as Array<{ tableId: string; tableCode?: string; ldCount: number }>,
+        }
       );
       if (serverTotalLdRealtime != null && !Number.isNaN(serverTotalLdRealtime)) {
         summary.totalLd = serverTotalLdRealtime;
       }
+      if (serverTotalLdPaid != null && !Number.isNaN(serverTotalLdPaid)) {
+        summary.totalLdPaid = serverTotalLdPaid;
+      }
+      if (serverTotalLdOpen != null && !Number.isNaN(serverTotalLdOpen)) {
+        summary.totalLdOpen = serverTotalLdOpen;
+      }
+      summary.openLdTables = serverOpenLdTables;
       setPayrollSummary(summary);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load payroll report");
@@ -1944,7 +1986,7 @@ export default function Reports() {
               value={dayStartHour}
               onChange={(e) => setDayStartHour(e.target.value === "" ? "" : Math.min(23, Math.max(0, parseInt(e.target.value, 10) || 0)))}
             />
-            <span className="text-xs text-muted-foreground">Applies to Sales, Product, Payroll, and Voids. Leave empty for calendar day. Set 4 so &quot;March 9&quot; = Mar 9 4am – Mar 10 3:59am.</span>
+            <span className="text-xs text-muted-foreground">Applies to Sales, Product, Payroll, and Voids. Leave empty for calendar midnight. Set 17 so Aug 10 = Aug 10 5pm–Aug 11 5pm. Aug 10–Aug 11 with hour 17 is the same night (not two days).</span>
           </div>
         )}
         {activeTab === "payroll" && (
@@ -2462,7 +2504,7 @@ export default function Reports() {
 
       {activeTab === "payroll" && (
         <>
-          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+          <div className="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-4">
             <StatCard
               label="Total Employees"
               value={displayPayrollSummary.totalEmployees}
@@ -2474,9 +2516,14 @@ export default function Reports() {
               icon={<DollarSign className="w-5 h-5" />}
             />
             <StatCard
-              label="Total LD (incl. open)"
-              value={displayPayrollSummary.totalLd}
+              label="Total LD (paid)"
+              value={displayPayrollSummary.totalLdPaid}
               icon={<ShoppingBag className="w-5 h-5" />}
+            />
+            <StatCard
+              label="Open LD"
+              value={displayPayrollSummary.totalLdOpen}
+              icon={<Clock className="w-5 h-5" />}
             />
             <StatCard
               label="Total Incentives"
@@ -2489,6 +2536,16 @@ export default function Reports() {
               icon={<Percent className="w-5 h-5" />}
             />
           </div>
+          <p className="text-sm text-muted-foreground mb-4">
+            Paid LD matches Product report (billed, non-void, non-comp). Open LD is still on unpaid tables and is not in Product qty.
+            {displayPayrollSummary.totalLdOpen > 0 && displayPayrollSummary.openLdTables.length > 0
+              ? ` Open LD is on: ${displayPayrollSummary.openLdTables
+                  .map((t) => `${t.tableCode || t.tableId} (${t.ldCount})`)
+                  .join(", ")}.`
+              : displayPayrollSummary.totalLdOpen > 0
+                ? " Check POS for unpaid tables — leftover pending lines on closed tables are no longer counted."
+                : ""}
+          </p>
 
           <div className="rounded-lg border border-border overflow-hidden">
           <Table wrapperClassName="max-h-[500px]">
@@ -2632,7 +2689,7 @@ export default function Reports() {
                 </div>
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <Clock className="w-4 h-4 shrink-0" />
-                  <span>{new Date(orderDetail.createdAt).toLocaleString()}</span>
+                  <span>{new Date(orderDetail.createdAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" })}</span>
                 </div>
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <CreditCard className="w-4 h-4 shrink-0" />
