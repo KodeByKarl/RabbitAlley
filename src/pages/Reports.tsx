@@ -2516,12 +2516,12 @@ export default function Reports() {
               icon={<DollarSign className="w-5 h-5" />}
             />
             <StatCard
-              label="Total LD (paid)"
-              value={displayPayrollSummary.totalLdPaid}
+              label="Total LD"
+              value={displayPayrollSummary.totalLd}
               icon={<ShoppingBag className="w-5 h-5" />}
             />
             <StatCard
-              label="Open LD"
+              label="Open LD (unpaid)"
               value={displayPayrollSummary.totalLdOpen}
               icon={<Clock className="w-5 h-5" />}
             />
@@ -2537,13 +2537,13 @@ export default function Reports() {
             />
           </div>
           <p className="text-sm text-muted-foreground mb-4">
-            Paid LD matches Product report (billed, non-void, non-comp). Open LD is still on unpaid tables and is not in Product qty.
+            Total LD is paid plus unpaid on open tables (same as each staff’s Total LD column). Product report qty is paid only.
             {displayPayrollSummary.totalLdOpen > 0 && displayPayrollSummary.openLdTables.length > 0
               ? ` Open LD is on: ${displayPayrollSummary.openLdTables
                   .map((t) => `${t.tableCode || t.tableId} (${t.ldCount})`)
                   .join(", ")}.`
               : displayPayrollSummary.totalLdOpen > 0
-                ? " Check POS for unpaid tables — leftover pending lines on closed tables are no longer counted."
+                ? " Check POS for unpaid tables — leftover pending lines on closed tables are not counted."
                 : ""}
           </p>
 
