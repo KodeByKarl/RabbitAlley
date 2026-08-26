@@ -3,11 +3,41 @@
  * Orders link via orders.session_id. Soft table_visit_id is kept for compatibility.
  */
 
+import { BRANCH_TIMEZONE, localDateString } from "./localDate.js";
+import { addDaysYmd } from "./revenueDay.js";
+
 const LEGACY_GAP_MS = 4 * 60 * 60 * 1000;
 const PAID_GAP_MS = 60 * 1000;
-/** An open session with no activity this long is a leftover occupancy (not today's seating). */
+/** Fallback age cap if last activity is still inside tonight's window. */
 export const STALE_SESSION_MS = 20 * 60 * 60 * 1000;
 export const LIVE_PENDING_HOURS = 20;
+/** Idle waiter claim (open session, no pending orders) older than this is cleared on floor load. */
+export const IDLE_CLAIM_MS = 15 * 60 * 1000;
+/**
+ * Nightclub day-break (matches payroll/sales operational hour 17).
+ * Occupancy from before tonight's 5pm Manila window is leftover and must not
+ * reappear when waiters log in for the new seating.
+ */
+export const FLOOR_DAY_START_HOUR = 17;
+
+function manilaHour(date) {
+  const hourStr = new Intl.DateTimeFormat("en-US", {
+    timeZone: BRANCH_TIMEZONE,
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+  const hour = parseInt(hourStr, 10);
+  return Number.isFinite(hour) && hour === 24 ? 0 : hour;
+}
+
+/** Instant of the current floor night start (today 17:00 Manila, or yesterday 17:00 if before 17:00). */
+export function getFloorWindowStart(now = new Date(), startHour = FLOOR_DAY_START_HOUR) {
+  const ymd = localDateString(now);
+  const hour = manilaHour(now);
+  const startYmd = hour < startHour ? addDaysYmd(ymd, -1) : ymd;
+  const hh = String(Math.min(23, Math.max(0, startHour))).padStart(2, "0");
+  return new Date(`${startYmd}T${hh}:00:00+08:00`);
+}
 
 export async function ensureTableSessionsSchema(db) {
   await db.execute(`
@@ -58,23 +88,28 @@ export async function getOpenSession(db, branchId, tableId) {
 }
 
 /**
- * Pending lines that belong to the current seating only.
- * Last-month leftovers that were vacuumed onto a new session are excluded
- * because their created_at is before this session opened.
+ * Pending lines that belong to tonight's seating only.
+ * Excludes leftover tabs from earlier nights even if they still have this session_id.
  */
 export function appendLivePendingSessionFilter(session) {
+  const floorStart = getFloorWindowStart();
+  const liveCap = new Date(Date.now() - LIVE_PENDING_HOURS * 60 * 60 * 1000);
+  const unsessionedMin = new Date(Math.max(floorStart.getTime(), liveCap.getTime()));
   if (session) {
+    const openedMs = toMs(session.opened_at);
+    const openedFloor = openedMs ? openedMs - 60 * 60 * 1000 : floorStart.getTime();
+    const minCreated = new Date(Math.max(openedFloor, unsessionedMin.getTime()));
     return {
       sql: ` AND (
-        session_id = ?
-        OR ((session_id IS NULL OR session_id = 0) AND created_at >= DATE_SUB(NOW(), INTERVAL ${LIVE_PENDING_HOURS} HOUR))
+        (session_id = ? AND created_at >= ?)
+        OR ((session_id IS NULL OR session_id = 0) AND created_at >= ?)
       )`,
-      params: [Number(session.id)],
+      params: [Number(session.id), minCreated, unsessionedMin],
     };
   }
   return {
-    sql: ` AND (session_id IS NULL OR session_id = 0) AND created_at >= DATE_SUB(NOW(), INTERVAL ${LIVE_PENDING_HOURS} HOUR)`,
-    params: [],
+    sql: ` AND (session_id IS NULL OR session_id = 0) AND created_at >= ?`,
+    params: [unsessionedMin],
   };
 }
 
@@ -119,7 +154,10 @@ export async function closeStaleOpenSessionIfNeeded(db, branchId, tableId, { max
   } catch {
     // orders.session_id may be missing on very old DBs
   }
-  if (Date.now() - lastMs < maxAgeMs) {
+  const floorStartMs = getFloorWindowStart().getTime();
+  const insideTonight = lastMs >= floorStartMs;
+  const insideAgeCap = Date.now() - lastMs < maxAgeMs;
+  if (insideTonight && insideAgeCap) {
     return { closed: false, session };
   }
   await closeSession(db, session.id, { closedBy: "system:stale-session" });
@@ -294,7 +332,78 @@ export async function releaseTableClaimIfIdle(db, branchId, tableId, employeeId)
   if (pending.length) return { released: false };
 
   await closeSession(db, session.id, { closedBy: `waiter:${emp}:release` });
+  await db.execute(
+    `UPDATE pos_tables SET status = 'available', current_order_id = NULL WHERE branch_id = ? AND id = ?`,
+    [branchId, tableId]
+  );
   return { released: true };
+}
+
+/**
+ * Clear ghost "In use" tables on the POS floor:
+ * - Occupied / open session with no live pending → vacate (except fresh idle claims still drafting).
+ * - Stale open sessions past STALE_SESSION_MS → closed.
+ * Tonight's unpaid tabs stay visible until paid.
+ */
+export async function reconcileFloorTables(db, branchId) {
+  if (!branchId) return { vacated: 0 };
+
+  let candidates;
+  try {
+    [candidates] = await db.execute(
+      `SELECT pt.id AS tableId, pt.status AS tableStatus, ts.id AS sessionId,
+              ts.waiter_id AS waiterId, ts.opened_at AS sessionOpenedAt
+       FROM pos_tables pt
+       LEFT JOIN table_sessions ts
+         ON ts.branch_id = pt.branch_id AND ts.table_id = pt.id AND ts.status = 'open'
+       WHERE pt.branch_id = ?
+         AND (pt.status = 'occupied' OR ts.id IS NOT NULL)`,
+      [branchId]
+    );
+  } catch (e) {
+    if (e.code === "ER_NO_SUCH_TABLE") return { vacated: 0 };
+    throw e;
+  }
+
+  let vacated = 0;
+  const now = Date.now();
+  for (const row of candidates || []) {
+    const tableId = row.tableId;
+    if (!tableId) continue;
+
+    await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
+    const session = await getOpenSession(db, branchId, tableId);
+    const live = appendLivePendingSessionFilter(session);
+    let pending;
+    try {
+      [pending] = await db.execute(
+        `SELECT id FROM orders
+         WHERE branch_id = ? AND table_id = ? AND status = 'pending' AND voided_at IS NULL
+         ${live.sql}
+         LIMIT 1`,
+        [branchId, tableId, ...live.params]
+      );
+    } catch (e) {
+      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+      [pending] = await db.execute(
+        `SELECT id FROM orders WHERE branch_id = ? AND table_id = ? AND status = 'pending' ${live.sql} LIMIT 1`,
+        [branchId, tableId, ...live.params]
+      );
+    }
+    if (pending.length) continue;
+
+    // Fresh idle claim (waiter still drafting cart) — leave locked briefly.
+    if (session && session.waiter_id) {
+      const age = now - toMs(session.opened_at);
+      if (age >= 0 && age < IDLE_CLAIM_MS) continue;
+    }
+
+    const didVacate = await vacateTableIfIdle(db, branchId, tableId, {
+      closedBy: "system:floor-reconcile",
+    });
+    if (didVacate) vacated += 1;
+  }
+  return { vacated };
 }
 
 /** Open a new session for a fresh seating (table was available). */
@@ -606,12 +715,36 @@ export async function mergeSessions(db, branchId, sourceTableId, targetTableId) 
  */
 export async function reconcileOrphanedPendingOrders(db, branchId = 1) {
   try {
-    const [orphans] = await db.execute(`
+    // Only tonight's orphans — leftover pending from earlier nights must not re-open tables on waiter login.
+    const floorStart = getFloorWindowStart();
+    let orphans;
+    try {
+      [orphans] = await db.execute(
+        `
       SELECT o.id, o.table_id, o.session_id, o.created_at, o.employee_id, ts.status as session_status
       FROM orders o
       LEFT JOIN table_sessions ts ON ts.id = o.session_id
-      WHERE o.branch_id = ? AND o.status = 'pending' AND (o.session_id IS NULL OR ts.status = 'closed')
-    `, [branchId]);
+      WHERE o.branch_id = ? AND o.status = 'pending'
+        AND o.voided_at IS NULL
+        AND (o.session_id IS NULL OR ts.status = 'closed')
+        AND o.created_at >= ?
+    `,
+        [branchId, floorStart]
+      );
+    } catch (e) {
+      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+      [orphans] = await db.execute(
+        `
+      SELECT o.id, o.table_id, o.session_id, o.created_at, o.employee_id, ts.status as session_status
+      FROM orders o
+      LEFT JOIN table_sessions ts ON ts.id = o.session_id
+      WHERE o.branch_id = ? AND o.status = 'pending'
+        AND (o.session_id IS NULL OR ts.status = 'closed')
+        AND o.created_at >= ?
+    `,
+        [branchId, floorStart]
+      );
+    }
 
     if (!orphans || !orphans.length) return;
 

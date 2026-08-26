@@ -79,6 +79,7 @@ import {
   appendLivePendingSessionFilter,
   fetchLivePendingOrderIds,
   reconcileOrphanedPendingOrders,
+  reconcileFloorTables,
 } from "./lib/tableSessions.js";
 import {
   ensureProductPricingSchema,
@@ -1600,6 +1601,11 @@ app.get("/api/dashboard/tables", requireAnyPermission("view_dashboard", "manage_
   const branchId = getBranchId(req);
   try {
     const db = await getPool();
+    // Drop leftover / ghost In-use so last night's tables don't come back on waiter login.
+    // Tonight's unpaid tabs stay visible.
+    await reconcileFloorTables(db, branchId).catch((err) => {
+      console.error("Floor table reconcile error:", err);
+    });
     const [rows] = await db.execute(
       `SELECT pt.id, pt.name, pt.area, pt.status, pt.current_order_id AS currentOrderId,
               ts.waiter_id AS lockedByEmployeeId,

@@ -1,5 +1,5 @@
 /** Map a joined order_items row to API item shape. */
-import { getOpenSession, appendLivePendingSessionFilter, closeStaleOpenSessionIfNeeded, reconcileOrphanedPendingOrders } from "./tableSessions.js";
+import { getOpenSession, appendLivePendingSessionFilter, closeStaleOpenSessionIfNeeded, reconcileOrphanedPendingOrders, reconcileFloorTables } from "./tableSessions.js";
 
 export function mapOrderItemRow(i) {
   return {
@@ -97,6 +97,9 @@ const ORDER_HEADER_SELECT_LEGACY = `id, table_id, status, subtotal, discount, ta
 
 export async function fetchPendingOrdersForTable(db, tableId, branchId) {
   await reconcileOrphanedPendingOrders(db, branchId);
+  await reconcileFloorTables(db, branchId).catch((err) => {
+    console.error("Floor table reconcile error:", err);
+  });
   await closeStaleOpenSessionIfNeeded(db, branchId, tableId);
   const session = await getOpenSession(db, branchId, tableId);
   const live = appendLivePendingSessionFilter(session);
