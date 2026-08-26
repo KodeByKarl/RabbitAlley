@@ -78,6 +78,7 @@ import {
   closeStaleOpenSessionIfNeeded,
   appendLivePendingSessionFilter,
   fetchLivePendingOrderIds,
+  reconcileOrphanedPendingOrders,
 } from "./lib/tableSessions.js";
 import {
   ensureProductPricingSchema,
@@ -7145,19 +7146,18 @@ app.post("/api/tables/merge", requireAnyPermission("transfer_table_orders"), asy
     try {
       const sessionId = await mergeSessions(db, branchId, sourceTableId, targetTableId);
       if (sessionId) {
-        const targetSess = await getOpenSession(db, branchId, targetTableId);
-        const liveMerge = appendLivePendingSessionFilter(targetSess || { id: sessionId, opened_at: new Date() });
         await db.execute(
           `UPDATE orders SET session_id = ?
-           WHERE branch_id = ? AND table_id = ? AND status = 'pending'
-           ${liveMerge.sql}`,
-          [sessionId, branchId, targetTableId, ...liveMerge.params]
+           WHERE branch_id = ? AND table_id = ? AND status = 'pending'`,
+          [sessionId, branchId, targetTableId]
         );
       }
       await reconcileTableVisitIds(db, branchId, targetTableId);
+      await reconcileOrphanedPendingOrders(db, branchId);
     } catch (sessErr) {
       if (sessErr.code !== "ER_NO_SUCH_TABLE") throw sessErr;
       await reconcileTableVisitIds(db, branchId, targetTableId);
+      await reconcileOrphanedPendingOrders(db, branchId);
     }
 
     res.json({ ok: true, message: "Orders merged successfully" });
