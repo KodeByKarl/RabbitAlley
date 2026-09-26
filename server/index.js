@@ -38,6 +38,8 @@ import {
   LATEST_PAYOUT_PER_USER_JOIN,
   latestPayoutPerUserParams,
   dedupePayrollRows,
+  payoutRowHasManualEntries,
+  sumIncentivesBreakdown,
 } from "./lib/payrollTotals.js";
 import { allocateOrderNumber, formatOrderDisplayNumber } from "./lib/orderNumbers.js";
 import {
@@ -1122,6 +1124,49 @@ async function resolveCurrentPayrollPeriod(db, branchId) {
   return { fromDate: today, toDate: today };
 }
 
+/**
+ * If the preferred payout row is blank, copy cashier-entered incentives/deductions
+ * from the same night stored as period_to = next day. Display-only; does not write.
+ */
+async function overlayManualPayoutEntries(db, payoutRows, fromDate, toDate) {
+  const userIds = [...new Set((payoutRows || []).map((r) => r.userId).filter((id) => id != null))];
+  if (!userIds.length) return;
+  const placeholders = userIds.map(() => "?").join(",");
+  let siblings = [];
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, user_id AS userId, adjustments, deductions,
+              incentives_breakdown, adjustments_breakdown, deductions_breakdown
+       FROM payouts
+       WHERE user_id IN (${placeholders})
+         AND period_from >= ? AND period_from <= ?
+         AND period_to <= DATE_ADD(?, INTERVAL 1 DAY)`,
+      [...userIds, fromDate, toDate, toDate]
+    );
+    siblings = rows || [];
+  } catch (err) {
+    if (err.code === "ER_BAD_FIELD_ERROR") return;
+    throw err;
+  }
+  const byUser = new Map();
+  for (const row of siblings) {
+    if (!payoutRowHasManualEntries(row)) continue;
+    const key = String(row.userId);
+    const prev = byUser.get(key);
+    if (!prev || Number(row.id) > Number(prev.id)) byUser.set(key, row);
+  }
+  for (const row of payoutRows) {
+    if (payoutRowHasManualEntries(row)) continue;
+    const donor = byUser.get(String(row.userId));
+    if (!donor || Number(donor.id) === Number(row.id)) continue;
+    row.adjustments = donor.adjustments;
+    row.deductions = donor.deductions;
+    row.incentives_breakdown = donor.incentives_breakdown;
+    row.adjustments_breakdown = donor.adjustments_breakdown;
+    row.deductions_breakdown = donor.deductions_breakdown;
+  }
+}
+
 /** LD lines on paid and open (pending) tabs count toward daily payroll — see PAYROLL_LD_* near top. */
 
 async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartHour = null) {
@@ -1240,35 +1285,104 @@ async function computePayrollForPeriod(db, branchId, fromDate, toDate, dayStartH
     let tablePay = quotaReached ? tableCount * tableIncentiveRate : 0;
     const incentives = branchIncentives + tablePay;
 
-    const [existing] = await db.execute(
-      `SELECT id, incentives_breakdown, adjustments, deductions FROM payouts
+    const manualSelect = `id, incentives_breakdown, adjustments_breakdown, deductions_breakdown, adjustments, deductions, status`;
+    const [exactRows] = await db.execute(
+      `SELECT ${manualSelect} FROM payouts
        WHERE user_id = ? AND period_from = ? AND period_to = ?
        ORDER BY id DESC LIMIT 1`,
       [staff.id, periodFrom, periodTo]
     );
+    let existing = exactRows[0] || null;
 
-    const otherSum = (() => {
-      if (!existing.length || !existing[0].incentives_breakdown) return 0;
+    // Same night was sometimes stored as from → next calendar day. Keep that row's
+    // manual incentives/deductions instead of inserting a blank payout.
+    let near = null;
+    if (periodFrom === periodTo) {
+      const [nearRows] = await db.execute(
+        `SELECT ${manualSelect} FROM payouts
+         WHERE user_id = ? AND period_from = ? AND period_to = DATE_ADD(?, INTERVAL 1 DAY)
+         ORDER BY id DESC LIMIT 1`,
+        [staff.id, periodFrom, periodFrom]
+      );
+      near = nearRows[0] || null;
+    }
+    if (!existing && near) {
       try {
-        const b = typeof existing[0].incentives_breakdown === "string" ? JSON.parse(existing[0].incentives_breakdown) : existing[0].incentives_breakdown;
-        return Array.isArray(b) ? b.reduce((s, x) => s + Number(x.amount || 0), 0) : 0;
-      } catch (_) { return 0; }
-    })();
-    const adjustments = existing.length ? Number(existing[0].adjustments ?? 0) : 0;
-    const deductions = existing.length ? Number(existing[0].deductions ?? 0) : 0;
+        await db.execute(`UPDATE payouts SET period_to = ? WHERE id = ?`, [periodTo, near.id]);
+        existing = near;
+        near = null;
+      } catch (periodErr) {
+        if (periodErr.code !== "ER_DUP_ENTRY") throw periodErr;
+      }
+    }
+    if (existing && near && Number(existing.id) !== Number(near.id) && !payoutRowHasManualEntries(existing) && payoutRowHasManualEntries(near)) {
+      const asJson = (value) => {
+        if (value == null) return null;
+        return typeof value === "string" ? value : JSON.stringify(value);
+      };
+      await db.execute(
+        `UPDATE payouts
+         SET incentives_breakdown = ?, adjustments_breakdown = ?, deductions_breakdown = ?,
+             adjustments = ?, deductions = ?
+         WHERE id = ?`,
+        [
+          asJson(near.incentives_breakdown),
+          asJson(near.adjustments_breakdown),
+          asJson(near.deductions_breakdown),
+          Number(near.adjustments ?? 0),
+          Number(near.deductions ?? 0),
+          existing.id,
+        ]
+      );
+      existing = {
+        ...existing,
+        incentives_breakdown: near.incentives_breakdown,
+        adjustments_breakdown: near.adjustments_breakdown,
+        deductions_breakdown: near.deductions_breakdown,
+        adjustments: near.adjustments,
+        deductions: near.deductions,
+      };
+    }
+
+    const otherSum = existing ? sumIncentivesBreakdown(existing.incentives_breakdown) : 0;
+    const adjustments = existing ? Number(existing.adjustments ?? 0) : 0;
+    const deductions = existing ? Number(existing.deductions ?? 0) : 0;
     const total = budget + commission + incentives + otherSum + adjustments - deductions;
 
-    if (existing.length > 0) {
+    if (existing) {
+      // Recompute commission/LD only. Do not clear manual lines or flip approved → draft.
       await db.execute(
-        `UPDATE payouts SET allowance = ?, hours = ?, commission = ?, incentives = ?, total = ?, status = 'draft' WHERE id = ?`,
-        [budget, 0, commission, incentives, total, existing[0].id]
+        `UPDATE payouts SET allowance = ?, hours = ?, commission = ?, incentives = ?, total = ? WHERE id = ?`,
+        [budget, 0, commission, incentives, total, existing.id]
       );
     } else {
-      await db.execute(
-        `INSERT INTO payouts (user_id, period_from, period_to, allowance, hours, commission, incentives, incentives_breakdown, total, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
-        [staff.id, periodFrom, periodTo, budget, 0, commission, incentives, JSON.stringify([]), total]
-      );
+      try {
+        await db.execute(
+          `INSERT INTO payouts (user_id, period_from, period_to, allowance, hours, commission, incentives, incentives_breakdown, total, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+          [staff.id, periodFrom, periodTo, budget, 0, commission, incentives, JSON.stringify([]), total]
+        );
+      } catch (insertErr) {
+        if (insertErr.code !== "ER_DUP_ENTRY") throw insertErr;
+        const [dupRows] = await db.execute(
+          `SELECT ${manualSelect} FROM payouts WHERE user_id = ? AND period_from = ? AND period_to = ? ORDER BY id DESC LIMIT 1`,
+          [staff.id, periodFrom, periodTo]
+        );
+        if (dupRows.length) {
+          const dup = dupRows[0];
+          const dupTotal =
+            budget +
+            commission +
+            incentives +
+            sumIncentivesBreakdown(dup.incentives_breakdown) +
+            Number(dup.adjustments ?? 0) -
+            Number(dup.deductions ?? 0);
+          await db.execute(
+            `UPDATE payouts SET allowance = ?, hours = ?, commission = ?, incentives = ?, total = ? WHERE id = ?`,
+            [budget, 0, commission, incentives, dupTotal, dup.id]
+          );
+        }
+      }
     }
 
     results.push({
@@ -5414,6 +5528,7 @@ app.get("/api/reports/payroll", requireAnyPermission("view_payroll", "manage_pay
       [branchId, ...latestPayoutPerUserParams(branchId, periodFrom, periodTo, fromDate, toDate)]
     );
     const payoutRows = dedupePayrollRows(rows);
+    await overlayManualPayoutEntries(db, payoutRows, fromDate, toDate);
     const parseBreakdown = (v) => {
       if (!v) return null;
       try { return Array.isArray(typeof v === "string" ? JSON.parse(v) : v) ? (typeof v === "string" ? JSON.parse(v) : v) : null; } catch (_) { return null; }

@@ -159,6 +159,81 @@ const today = new Intl.DateTimeFormat("en-CA", {
 }).format(new Date());
 
 
+interface FinalBillReceipt {
+  orderNumber?: string;
+  date?: string;
+  time?: string;
+  table?: string;
+  cashier?: string;
+  businessName?: string;
+  businessAddress?: string;
+  businessContact?: string;
+  receiptFooter?: string;
+  vatTin?: string;
+  serviceLabel?: string;
+  taxLabel?: string;
+  items?: Array<{ name: string; quantity: number; subtotal: number }>;
+  subtotal?: number;
+  complimentary?: number;
+  discount?: number;
+  serviceCharge?: number;
+  tax?: number;
+  cardSurcharge?: number;
+  total?: number;
+  paymentMethod?: string;
+  originalPaymentMethod?: string | null;
+  amountPaid?: number;
+  change?: number;
+  isReprint?: boolean;
+}
+
+/** One official receipt for the whole paid visit, not one slip per order tab. */
+function mergeFinalBillReceipts(
+  entries: Array<{ orderId: string; receipt: FinalBillReceipt }>
+): Array<{ orderId: string; receipt: FinalBillReceipt }> {
+  if (entries.length <= 1) return entries;
+  const receipts = entries.map((entry) => entry.receipt || {});
+  const sum = (key: keyof FinalBillReceipt) =>
+    receipts.reduce((total, receipt) => total + Number(receipt[key] ?? 0), 0);
+  const paymentMethods = Array.from(
+    new Set(
+      receipts
+        .map((receipt) => String(receipt.originalPaymentMethod || receipt.paymentMethod || "").trim())
+        .filter((method) => method && !/^reprint$/i.test(method))
+    )
+  );
+  const orderNumbers = receipts.map((receipt) => String(receipt.orderNumber || "").trim()).filter(Boolean);
+  const mergedTotal = sum("total");
+  const mergedChange = sum("change");
+  const mergedComplimentary = sum("complimentary");
+  const mergedDiscount = sum("discount");
+  const mergedCardFee = sum("cardSurcharge");
+  const base = receipts[0] || {};
+  const paymentLabel = paymentMethods.length === 1 ? paymentMethods[0] : paymentMethods.join(" / ") || base.paymentMethod;
+  return [
+    {
+      orderId: entries.map((entry) => entry.orderId).filter(Boolean).join(","),
+      receipt: {
+        ...base,
+        orderNumber: orderNumbers.join(", ") || base.orderNumber,
+        items: receipts.flatMap((receipt) => (Array.isArray(receipt.items) ? receipt.items : [])),
+        subtotal: sum("subtotal"),
+        complimentary: mergedComplimentary > 0 ? mergedComplimentary : undefined,
+        discount: mergedDiscount > 0 ? mergedDiscount : undefined,
+        serviceCharge: sum("serviceCharge"),
+        tax: sum("tax"),
+        cardSurcharge: mergedCardFee > 0 ? mergedCardFee : undefined,
+        total: mergedTotal,
+        amountPaid: mergedTotal + mergedChange,
+        change: mergedChange,
+        paymentMethod: paymentLabel,
+        originalPaymentMethod: paymentLabel,
+        isReprint: true,
+      },
+    },
+  ];
+}
+
 /** Format period (dateFrom, dateTo) as "Salary Slip for July 2025" */
 function getSalarySlipMonthYear(dateFrom: string, dateTo: string): string {
   const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -1084,7 +1159,9 @@ export default function Reports() {
         };
       }>
     ) => {
-    if (!entries.length) return;
+    const mergedEntries = mergeFinalBillReceipts(entries);
+    if (!mergedEntries.length) return;
+    entries = mergedEntries;
     const w = window.open("", "_blank", "width=420,height=980,scrollbars=yes");
     if (!w) return;
     const sections = entries.map(({ receipt, orderId }) => {
@@ -1139,8 +1216,7 @@ export default function Reports() {
           <style>
             @page { size: 80mm auto; margin: 3mm 2mm 8mm 2mm; }
             body { margin: 0; padding: 0; font-family: 'Courier New', monospace; font-size: 11px; color: #000; background: #fff; }
-            .receipt { width: 76mm; margin: 0 auto 8mm; padding: 5px 3px; page-break-after: always; }
-            .receipt:last-child { page-break-after: auto; }
+            .receipt { width: 76mm; margin: 0 auto; padding: 5px 3px 12mm; page-break-inside: avoid; }
             .center { text-align: center; }
             .bold { font-weight: 700; }
             .reprint { margin-top: 2px; font-weight: 700; }
@@ -1174,7 +1250,9 @@ export default function Reports() {
       const { receipts } = await api.orders.reprintFinalBills(orderIds, "sales_report");
       printFinalBillReceipts(receipts);
       toast.success(
-        `Final bill reprint: ${receipts.length} receipt${receipts.length > 1 ? "s" : ""}`
+        receipts.length > 1
+          ? `Final bill reprint: 1 receipt for ${receipts.length} orders`
+          : "Final bill reprint opened"
       );
       return;
     } catch (e) {
@@ -2782,6 +2860,13 @@ export default function Reports() {
                   onClick={async () => {
                     if (!orderDetail) return;
                     if (orderDetail.status === "paid" && canReprintFinalBill) {
+                      const group = salesGroups.find((g) =>
+                        g.orders.some((order) => orderIdFromCode(order.id) === orderIdFromCode(orderDetail.id))
+                      );
+                      if (group && group.orderCount > 1) {
+                        await handlePrintTransaction(group);
+                        return;
+                      }
                       try {
                         const { receipt, orderId } = await api.orders.reprintFinalBill(
                           orderIdFromCode(orderDetail.id),

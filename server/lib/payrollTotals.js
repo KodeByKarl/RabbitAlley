@@ -1,22 +1,53 @@
 /**
  * One payout row per employee for a date range.
- * Prefers an exact period_from/period_to match; otherwise the latest nested period.
+ * A single night may be stored as from→from or from→next day. Prefer the row that
+ * still has manual deductions/adjustments, then an exact period, then that next-day row.
  */
 export const LATEST_PAYOUT_PER_USER_JOIN = `JOIN (
     SELECT p2.user_id AS userId,
       COALESCE(
+        MAX(CASE
+          WHEN p2.period_from = ? AND p2.period_to = ?
+           AND (COALESCE(p2.deductions, 0) <> 0 OR COALESCE(p2.adjustments, 0) <> 0)
+          THEN p2.id END),
+        MAX(CASE
+          WHEN ? = ? AND p2.period_from = ? AND p2.period_to = DATE_ADD(?, INTERVAL 1 DAY)
+           AND (COALESCE(p2.deductions, 0) <> 0 OR COALESCE(p2.adjustments, 0) <> 0)
+          THEN p2.id END),
         MAX(CASE WHEN p2.period_from = ? AND p2.period_to = ? THEN p2.id END),
+        MAX(CASE
+          WHEN ? = ? AND p2.period_from = ? AND p2.period_to = DATE_ADD(?, INTERVAL 1 DAY)
+          THEN p2.id END),
         MAX(p2.id)
       ) AS id
     FROM payouts p2
     JOIN users u2 ON u2.id = p2.user_id AND u2.branch_id = ?
-    WHERE p2.period_from >= ? AND p2.period_to <= ?
+    WHERE p2.period_from >= ? AND p2.period_from <= ?
+      AND p2.period_to <= DATE_ADD(?, INTERVAL 1 DAY)
     GROUP BY p2.user_id
   ) latest ON latest.id = p.id`;
 
 /** Params after the outer `users.branch_id = ?` bind. prefer* is exact period; range* is the nested date window. */
 export function latestPayoutPerUserParams(branchId, preferFrom, preferTo, rangeFrom = preferFrom, rangeTo = preferTo) {
-  return [preferFrom, preferTo, branchId, rangeFrom, rangeTo];
+  return [
+    preferFrom, preferTo,
+    preferFrom, preferTo, preferFrom, preferFrom,
+    preferFrom, preferTo,
+    preferFrom, preferTo, preferFrom, preferFrom,
+    branchId,
+    rangeFrom, rangeTo, rangeTo,
+  ];
+}
+
+/** True when a payout still has cashier-entered incentives, adjustments, or deductions. */
+export function payoutRowHasManualEntries(row) {
+  if (!row) return false;
+  if (Number(row.adjustments || 0) !== 0 || Number(row.deductions || 0) !== 0) return true;
+  return (
+    sumIncentivesBreakdown(row.incentives_breakdown ?? row.incentivesBreakdown) !== 0 ||
+    sumIncentivesBreakdown(row.adjustments_breakdown ?? row.adjustmentsBreakdown) !== 0 ||
+    sumIncentivesBreakdown(row.deductions_breakdown ?? row.deductionsBreakdown) !== 0
+  );
 }
 
 /** One row per employee even if overlapping payout periods exist. */
