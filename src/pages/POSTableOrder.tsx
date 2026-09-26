@@ -43,7 +43,7 @@ export default function POSTableOrder() {
   const { tableId } = useParams<{ tableId: string }>();
   const navigate = useNavigate();
   const { user, hasPermission, logout } = useAuth();
-  const floorWaiter = isFloorWaiter(hasPermission);
+  const floorWaiter = isFloorWaiter(hasPermission, user?.role);
   const {
     table,
     setTable,

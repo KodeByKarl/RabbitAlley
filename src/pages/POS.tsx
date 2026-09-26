@@ -3,8 +3,10 @@ import { useLocation } from "react-router-dom";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { TableGrid } from "@/components/dashboard/TableGrid";
+import { FloorCapacityBanner } from "@/components/dashboard/FloorCapacityBanner";
 import { useAuth } from "@/contexts/AuthContext";
 import { isFloorWaiter } from "@/lib/floorStaff";
+import { isFloorAtTableCapacity, MAX_FLOOR_TABLES } from "@/lib/tableCapacity";
 import { api } from "@/lib/api";
 import { mapApiTable } from "@/types/pos";
 import type { Table } from "@/types/pos";
@@ -31,7 +33,7 @@ import { toast } from "sonner";
 export default function POS() {
   const location = useLocation();
   const { hasPermission, user } = useAuth();
-  const floorWaiter = isFloorWaiter(hasPermission);
+  const floorWaiter = isFloorWaiter(hasPermission, user?.role);
   const canAddTable = hasPermission("manage_settings");
   const canMergeTables = hasPermission("transfer_table_orders") || hasPermission("manage_settings");
   const [tables, setTables] = useState<Table[]>([]);
@@ -79,6 +81,12 @@ export default function POS() {
     e.preventDefault();
     if (!addName.trim()) {
       toast.error("Table name is required");
+      return;
+    }
+    if (isFloorAtTableCapacity(tables.length)) {
+      toast.error(
+        `System overload: floor has ${tables.length} tables (max ${MAX_FLOOR_TABLES}). Call for maintenance.`
+      );
       return;
     }
     setSaving(true);
@@ -252,7 +260,15 @@ export default function POS() {
         description="Select a table to start or view an order"
       >
         {canAddTable && (
-          <Button onClick={() => setAddTableOpen(true)}>
+          <Button
+            onClick={() => setAddTableOpen(true)}
+            disabled={isFloorAtTableCapacity(tables.length)}
+            title={
+              isFloorAtTableCapacity(tables.length)
+                ? `System overload — ${tables.length}/${MAX_FLOOR_TABLES} tables. Call for maintenance.`
+                : undefined
+            }
+          >
             <Plus className="w-4 h-4 mr-2" />
             Add Table
           </Button>
@@ -270,6 +286,7 @@ export default function POS() {
           </>
         )}
       </PageHeader>
+      {!loading && <FloorCapacityBanner tableCount={tables.length} />}
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {posDisplayAreas.map((area) => (
@@ -299,7 +316,11 @@ export default function POS() {
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Add Table</DialogTitle>
-            <p className="text-sm text-muted-foreground">Extend your floor with a new table. It will appear in the selected area.</p>
+            <p className="text-sm text-muted-foreground">
+              {isFloorAtTableCapacity(tables.length)
+                ? `System overload — ${tables.length}/${MAX_FLOOR_TABLES} tables. Call for maintenance before adding more.`
+                : `Extend your floor with a new table (${tables.length}/${MAX_FLOOR_TABLES}). It will appear in the selected area.`}
+            </p>
           </DialogHeader>
           <form onSubmit={handleAddTable} className="space-y-4">
             <div className="space-y-2">
@@ -309,11 +330,16 @@ export default function POS() {
                 value={addName}
                 onChange={(e) => setAddName(e.target.value)}
                 placeholder="e.g. L7, C9, LD5"
+                disabled={isFloorAtTableCapacity(tables.length)}
               />
             </div>
             <div className="space-y-2">
               <Label>Area</Label>
-              <Select value={addArea} onValueChange={(v) => setAddArea(v as "Lounge" | "Club")}>
+              <Select
+                value={addArea}
+                onValueChange={(v) => setAddArea(v as "Lounge" | "Club")}
+                disabled={isFloorAtTableCapacity(tables.length)}
+              >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {posDisplayAreas.map((a) => (
@@ -324,7 +350,9 @@ export default function POS() {
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setAddTableOpen(false)}>Cancel</Button>
-              <Button type="submit" disabled={saving}>{saving ? "Adding…" : "Add Table"}</Button>
+              <Button type="submit" disabled={saving || isFloorAtTableCapacity(tables.length)}>
+                {saving ? "Adding…" : "Add Table"}
+              </Button>
             </DialogFooter>
           </form>
         </DialogContent>

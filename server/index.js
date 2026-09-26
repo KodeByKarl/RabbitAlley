@@ -1756,8 +1756,23 @@ app.post("/api/dashboard/tables", requireAnyPermission("manage_settings"), async
   const nameTrim = String(name).trim();
   const validAreas = ["Lounge", "Club", "LD"];
   if (!validAreas.includes(area)) return res.status(400).json({ error: "Area must be Lounge, Club, or LD" });
+  /** Soft floor capacity — beyond this the map needs maintenance / layout review. */
+  const MAX_FLOOR_TABLES = 40;
   try {
     const db = await getPool();
+    const [countRows] = await db.execute(
+      "SELECT COUNT(*) AS c FROM pos_tables WHERE branch_id = ?",
+      [branchId]
+    );
+    const tableCount = Number(countRows[0]?.c ?? 0);
+    if (tableCount >= MAX_FLOOR_TABLES) {
+      return res.status(400).json({
+        error: `System overload: floor has ${tableCount} tables (max ${MAX_FLOOR_TABLES}). Call for maintenance before adding more.`,
+        code: "TABLE_CAPACITY",
+        tableCount,
+        maxTables: MAX_FLOOR_TABLES,
+      });
+    }
     let id = nameTrim.replace(/\s+/g, "_").slice(0, 16) || "T";
     const [existing] = await db.execute(
       "SELECT id FROM pos_tables WHERE branch_id = ? AND id = ?",

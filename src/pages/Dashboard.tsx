@@ -3,6 +3,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { StatCard } from "@/components/dashboard/StatCard";
 import { TableGrid } from "@/components/dashboard/TableGrid";
+import { FloorCapacityBanner } from "@/components/dashboard/FloorCapacityBanner";
 import { api } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { isFloorWaiter } from "@/lib/floorStaff";
@@ -13,7 +14,7 @@ import { formatCurrency } from "@/lib/utils";
 
 export default function Dashboard() {
   const { user, hasPermission } = useAuth();
-  const floorWaiter = isFloorWaiter(hasPermission);
+  const floorWaiter = isFloorWaiter(hasPermission, user?.role);
 
   const [stats, setStats] = useState<Awaited<ReturnType<typeof api.dashboard.stats>> | null>(null);
   const [tables, setTables] = useState<Table[]>([]);
@@ -99,6 +100,7 @@ export default function Dashboard() {
 
           <div className="mb-4">
             <h2 className="text-lg font-semibold mb-4">Table Overview</h2>
+            <FloorCapacityBanner tableCount={tables.length} />
           </div>
           <TableGrid
             tables={tables}

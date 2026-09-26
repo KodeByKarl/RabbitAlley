@@ -294,8 +294,21 @@ export async function assertWaiterOwnsTable(db, branchId, tableId, employeeId) {
 /** Floor waiters take orders; cashiers/managers open any table for payment. */
 export function isFloorWaiter(authUser) {
   if (!authUser?.permissions) return false;
+  const roleName = String(authUser.roleName || authUser.role || "").trim().toLowerCase();
+  if (roleName === "administrator" || roleName === "operations staff") {
+    return false;
+  }
   const perms = authUser.permissions;
-  return perms.includes("create_orders") && !perms.includes("accept_payments");
+  if (
+    perms.includes("accept_payments") ||
+    perms.includes("manage_settings") ||
+    perms.includes("approve_discounts") ||
+    perms.includes("approve_voids") ||
+    perms.includes("manage_staff")
+  ) {
+    return false;
+  }
+  return perms.includes("create_orders");
 }
 
 /**
