@@ -3399,7 +3399,7 @@ export default function POSTableOrder() {
                       {m.voided ? " [voided]" : ""}
                     </span>
                     {m.tableId && m.status === "pending" && !m.voided && m.tableId !== tableId && (
-                      <Button type="button" size="sm" variant="outline" onClick={() => { setVoidModalOpen(false); navigate(`/pos/table/${m.tableId}`); }}>
+                      <Button type="button" size="sm" variant="outline" onClick={() => { setVoidModalOpen(false); navigate(`/pos/table/${encodeURIComponent(m.tableId)}`); }}>
                         Open table
                       </Button>
                     )}

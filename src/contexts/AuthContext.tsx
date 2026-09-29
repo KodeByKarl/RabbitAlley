@@ -1,5 +1,7 @@
-import { createContext, useContext, useState, ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, ReactNode } from "react";
+import { toast } from "sonner";
 import { STORAGE_USER, STORAGE_PERMISSIONS, STORAGE_AUTH_TOKEN } from "@/lib/storage-keys";
+import { AUTH_EXPIRED_EVENT } from "@/lib/api";
 
 /** Role names exactly as stored in the database (PascalCase). */
 export type UserRole = "Administrator" | "Staff" | "Operations Staff" | string;
@@ -75,6 +77,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem(STORAGE_PERMISSIONS);
     localStorage.removeItem(STORAGE_AUTH_TOKEN);
   };
+
+  useEffect(() => {
+    const onExpired = () => {
+      setUser((prev) => {
+        if (prev) toast.error("Session expired. Please log in again.", { id: "auth-expired" });
+        return null;
+      });
+      setPermissions([]);
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+  }, []);
 
   const hasPermission = (permission: string): boolean => {
     if (!user) return false;

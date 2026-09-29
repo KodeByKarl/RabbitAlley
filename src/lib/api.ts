@@ -17,6 +17,21 @@ function getAuthToken(): string | null {
   return token && token.trim() ? token.trim() : null;
 }
 
+/** Fired when the server rejects the session so the app can return to the login screen. */
+export const AUTH_EXPIRED_EVENT = "pos:auth-expired";
+
+function handleUnauthorized(): void {
+  localStorage.removeItem(STORAGE_AUTH_TOKEN);
+  localStorage.removeItem(STORAGE_USER);
+  localStorage.removeItem(STORAGE_PERMISSIONS);
+  window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+}
+
+/** Path segment for a table id (ids may contain "/" from older table names). */
+function tablePath(tableId: string): string {
+  return encodeURIComponent(tableId);
+}
+
 /** Branch ID for multi-branch: from logged-in user, default 1 */
 function getBranchId(): string {
   const user = getStoredUser();
@@ -43,11 +58,7 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
     headers,
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) {
-    localStorage.removeItem(STORAGE_AUTH_TOKEN);
-    localStorage.removeItem(STORAGE_USER);
-    localStorage.removeItem(STORAGE_PERMISSIONS);
-  }
+  if (res.status === 401) handleUnauthorized();
   if (!res.ok) {
     const err = new Error((data as { error?: string }).error || "Request failed") as Error & {
       status?: number;
@@ -75,11 +86,7 @@ async function fetchPrintHtml(path: string, body: unknown): Promise<string> {
   if (authToken) headers.Authorization = `Bearer ${authToken}`;
 
   const res = await fetch(`${API}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
-  if (res.status === 401) {
-    localStorage.removeItem(STORAGE_AUTH_TOKEN);
-    localStorage.removeItem(STORAGE_USER);
-    localStorage.removeItem(STORAGE_PERMISSIONS);
-  }
+  if (res.status === 401) handleUnauthorized();
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error((data as { error?: string }).error || "Request failed");
@@ -228,8 +235,8 @@ export const api = {
     createTable: (body: { name: string; area: string }) =>
       fetchApi<{ id: string; name: string; area: string; status: string; currentOrderId?: string }>("/api/dashboard/tables", { method: "POST", body: JSON.stringify(body) }),
     updateTable: (id: string, body: { name?: string; area?: string; status?: string }) =>
-      fetchApi<{ id: string; name: string; area: string; status: string; currentOrderId?: string }>(`/api/dashboard/tables/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-    deleteTable: (id: string) => fetchApi<{ ok: boolean }>(`/api/dashboard/tables/${id}`, { method: "DELETE" }),
+      fetchApi<{ id: string; name: string; area: string; status: string; currentOrderId?: string }>(`/api/dashboard/tables/${tablePath(id)}`, { method: "PUT", body: JSON.stringify(body) }),
+    deleteTable: (id: string) => fetchApi<{ ok: boolean }>(`/api/dashboard/tables/${tablePath(id)}`, { method: "DELETE" }),
   },
   pos: {
     tableSession: (tableId: string) =>
@@ -237,11 +244,11 @@ export const api = {
         table: { id: string; name: string; area: string; status: string; currentOrderId?: string };
         orders: Array<Order & { orderNumber: string; items: OrderItem[]; voidedAt?: string | null; voidedByName?: string | null }>;
         tableStatus: string;
-      }>(`/api/pos/tables/${tableId}/session`),
+      }>(`/api/pos/tables/${tablePath(tableId)}/session`),
     claimTable: (tableId: string) =>
-      fetchApi<{ ok: boolean; claimed: boolean; sessionId?: number }>(`/api/pos/tables/${tableId}/claim`, { method: "POST" }),
+      fetchApi<{ ok: boolean; claimed: boolean; sessionId?: number }>(`/api/pos/tables/${tablePath(tableId)}/claim`, { method: "POST" }),
     releaseTable: (tableId: string) =>
-      fetchApi<{ ok: boolean; released: boolean }>(`/api/pos/tables/${tableId}/release`, { method: "POST" }),
+      fetchApi<{ ok: boolean; released: boolean }>(`/api/pos/tables/${tablePath(tableId)}/release`, { method: "POST" }),
   },
   orders: {
     create: (body: { tableId: string; employeeId?: string; items: OrderItem[]; subtotal: number; tax: number; total: number }) =>
@@ -252,7 +259,7 @@ export const api = {
       fetchApi<{
         orders: Array<Order & { orderNumber?: string; items: OrderItem[]; voidedAt?: string | null; voidedByName?: string | null }>;
         tableStatus: "available" | "occupied";
-      }>(`/api/orders/table/${tableId}`),
+      }>(`/api/orders/table/${tablePath(tableId)}`),
     lookup: (orderNumber: string) =>
       fetchApi<{
         matches: Array<{
@@ -1017,7 +1024,7 @@ export const api = {
         change?: number;
         amountReceived?: number;
       }>(
-        `/api/tables/${tableId}/pay-all`,
+        `/api/tables/${tablePath(tableId)}/pay-all`,
         {
           method: "POST",
           body: JSON.stringify({
@@ -1048,7 +1055,7 @@ export const api = {
         cardSurcharge: number;
         baseTotal: number;
         total: number;
-      }>(`/api/tables/${tableId}/bill-preview`, {
+      }>(`/api/tables/${tablePath(tableId)}/bill-preview`, {
         method: "POST",
         body: JSON.stringify(body),
       }),
@@ -1058,7 +1065,7 @@ export const api = {
         tableId: string;
         createdAt: string;
         receipt: Record<string, unknown>;
-      }>(`/api/tables/${tableId}/running-bill-snapshot`),
+      }>(`/api/tables/${tablePath(tableId)}/running-bill-snapshot`),
     transfer: (data: { orderId?: string; fromTable: string; toTable: string; transferredBy: string; reason?: string; transferAll?: boolean }) =>
       fetchApi<{ ok: boolean; message: string; action?: "move" | "swap" }>("/api/tables/transfer", { method: "POST", body: JSON.stringify(data) }),
     merge: (data: { sourceOrderId: string; targetOrderId: string; transferredBy: string; reason?: string }) =>

@@ -44,7 +44,7 @@ export function TableGrid({
               <TableCard
                 key={table.id}
                 table={table}
-                linkTo={`${linkPrefix}/${table.id}`}
+                linkTo={`${linkPrefix}/${encodeURIComponent(table.id)}`}
                 showActions={showTableActions}
                 onEdit={onEditTable}
                 onDelete={onDeleteTable}

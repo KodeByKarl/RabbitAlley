@@ -1622,10 +1622,11 @@ app.post("/api/auth/verify-manager", requireAuth, async (req, res) => {
        WHERE u.employee_id = ? AND u.active = 1 AND r.guard = 'web'`,
       [String(employeeId).trim().toUpperCase()]
     );
-    if (rows.length === 0) return res.status(401).json({ error: "Invalid Employee ID or Password" });
+    // 403, not 401: a wrong manager password must not end the cashier's own session.
+    if (rows.length === 0) return res.status(403).json({ error: "Invalid Employee ID or Password" });
     const user = rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: "Invalid Employee ID or Password" });
+    if (!valid) return res.status(403).json({ error: "Invalid Employee ID or Password" });
     const [permRows] = await db.execute(
       `SELECT p.name FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id WHERE rp.role_id = ?`,
       [user.role_id]
@@ -1773,7 +1774,8 @@ app.post("/api/dashboard/tables", requireAnyPermission("manage_settings"), async
         maxTables: MAX_FLOOR_TABLES,
       });
     }
-    let id = nameTrim.replace(/\s+/g, "_").slice(0, 16) || "T";
+    // The id is used as a URL path segment, so keep it to safe characters.
+    let id = nameTrim.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 16) || "T";
     const [existing] = await db.execute(
       "SELECT id FROM pos_tables WHERE branch_id = ? AND id = ?",
       [branchId, id]
@@ -2694,7 +2696,7 @@ app.post("/api/orders/:id/void", requireAnyPermission("request_voids", "approve_
     res.json({ ok: true, voidedByName: manager.name });
   } catch (err) {
     if (err.message && (err.message.includes("Employee ID") || err.message.includes("Password") || err.message.includes("Manager") || err.message.includes("required"))) {
-      return res.status(401).json({ error: err.message });
+      return res.status(403).json({ error: err.message });
     }
     console.error("Order void error:", err);
     res.status(500).json({ error: err.message || "Failed to void order" });
@@ -2772,7 +2774,7 @@ app.patch("/api/order-items/:id/void", requireAnyPermission("request_voids", "ap
     res.json({ ok: true, voidedByName: manager.name });
   } catch (err) {
     if (err.message && (err.message.includes("Employee ID") || err.message.includes("Password") || err.message.includes("Manager") || err.message.includes("required"))) {
-      return res.status(401).json({ error: err.message });
+      return res.status(403).json({ error: err.message });
     }
     console.error("Item void error:", err);
     res.status(500).json({ error: err.message || "Failed to void item" });
