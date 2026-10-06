@@ -85,7 +85,7 @@ export default function POS() {
     }
     if (isFloorAtTableCapacity(tables.length)) {
       toast.error(
-        `System overload: floor has ${tables.length} tables (max ${MAX_FLOOR_TABLES}). Call for maintenance.`
+        `Floor has reached maximum capacity of ${MAX_FLOOR_TABLES} tables.`
       );
       return;
     }
@@ -265,7 +265,7 @@ export default function POS() {
             disabled={isFloorAtTableCapacity(tables.length)}
             title={
               isFloorAtTableCapacity(tables.length)
-                ? `System overload — ${tables.length}/${MAX_FLOOR_TABLES} tables. Call for maintenance.`
+                ? `Maximum table limit reached (${tables.length}/${MAX_FLOOR_TABLES} tables).`
                 : undefined
             }
           >
@@ -318,7 +318,7 @@ export default function POS() {
             <DialogTitle>Add Table</DialogTitle>
             <p className="text-sm text-muted-foreground">
               {isFloorAtTableCapacity(tables.length)
-                ? `System overload — ${tables.length}/${MAX_FLOOR_TABLES} tables. Call for maintenance before adding more.`
+                ? `Maximum table limit reached (${tables.length}/${MAX_FLOOR_TABLES} tables).`
                 : `Extend your floor with a new table (${tables.length}/${MAX_FLOOR_TABLES}). It will appear in the selected area.`}
             </p>
           </DialogHeader>
