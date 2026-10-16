@@ -4,6 +4,7 @@ import { PageHeader } from "@/components/layout/PageHeader";
 import { StatCard } from "@/components/dashboard/StatCard";
 import { TableGrid } from "@/components/dashboard/TableGrid";
 import { FloorCapacityBanner } from "@/components/dashboard/FloorCapacityBanner";
+import { countFloorTables } from "@/lib/tableCapacity";
 import { api } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { isFloorWaiter } from "@/lib/floorStaff";
@@ -100,7 +101,7 @@ export default function Dashboard() {
 
           <div className="mb-4">
             <h2 className="text-lg font-semibold mb-4">Table Overview</h2>
-            <FloorCapacityBanner tableCount={tables.length} />
+            <FloorCapacityBanner tableCount={countFloorTables(tables)} />
           </div>
           <TableGrid
             tables={tables}
