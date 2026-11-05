@@ -13,6 +13,7 @@ import {
   loadPendingBillAdjustments,
   savePendingBillAdjustments,
   clearPendingBillAdjustments,
+  validatePendingDiscount,
 } from "@/lib/pendingBillAdjustments";
 import {
   type PaymentMethod,
@@ -40,6 +41,11 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 
 export default function POSTableOrder() {
+  const { tableId } = useParams<{ tableId: string }>();
+  return <TableOrder key={tableId} />;
+}
+
+function TableOrder() {
   const { tableId } = useParams<{ tableId: string }>();
   const navigate = useNavigate();
   const { user, hasPermission, logout } = useAuth();
@@ -135,14 +141,30 @@ export default function POSTableOrder() {
   const [managerAuthError, setManagerAuthError] = useState<string | null>(null);
   const [managerAuthLoading, setManagerAuthLoading] = useState(false);
   const [availableDiscounts, setAvailableDiscounts] = useState<Array<{ id: string; name: string; type: string; value: string; category?: string | null }>>([]);
-  const [appliedDiscount, setAppliedDiscount] = useState<{ id: string; name: string; type: string; value: string } | null>(
-    () => loadPendingBillAdjustments(tableId)?.appliedDiscount ?? null
-  );
+  const [appliedDiscount, setAppliedDiscount] = useState<{ id: string; name: string; type: string; value: string } | null>(null);
+  const [discountRestored, setDiscountRestored] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const saved = loadPendingBillAdjustments(tableId)?.appliedDiscount ?? null;
+    const restore = async () => {
+      try {
+        const discounts = saved && saved.id !== "exact_amount" ? await api.discounts.list() : [];
+        if (!cancelled) setAppliedDiscount(validatePendingDiscount(saved, discounts));
+      } catch {
+        // Never charge using an unverified cached catalog discount.
+      } finally {
+        if (!cancelled) setDiscountRestored(true);
+      }
+    };
+    void restore();
+    return () => { cancelled = true; };
+  }, [tableId]);
 
   // Persist pending discount / payment method (card surcharge) for this table session.
   // Survives Bill Summary print and re-opening payment; cleared only on pay or manual remove.
   useEffect(() => {
-    if (!tableId) return;
+    if (!tableId || !discountRestored) return;
     savePendingBillAdjustments(tableId, {
       appliedDiscount,
       selectedPaymentMethod,
@@ -155,6 +177,7 @@ export default function POSTableOrder() {
     });
   }, [
     tableId,
+    discountRestored,
     appliedDiscount,
     selectedPaymentMethod,
     useSplitPayment,
@@ -1456,6 +1479,10 @@ export default function POSTableOrder() {
   };
 
   const handleProcessPayment = async () => {
+    if (!discountRestored) {
+      toast.error("Please wait while the saved discount is checked");
+      return;
+    }
     if (!hasAnySentOrder) {
       toast.error("Send at least one order to departments first");
       return;
@@ -1464,8 +1491,10 @@ export default function POSTableOrder() {
     try {
       const discounts = await api.discounts.list();
       setAvailableDiscounts(discounts.filter((d) => d.status === "approved"));
+      setAppliedDiscount((current) => validatePendingDiscount(current, discounts));
     } catch {
-      // Discounts failed to load
+      toast.error("Could not verify discounts. Please try again.");
+      return;
     }
     // Do not reset applied discount / payment method / card surcharge — they persist
     // until payment completes or staff removes them. Bill Summary print is read-only.

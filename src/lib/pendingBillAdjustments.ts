@@ -6,6 +6,18 @@
 
 export type PendingDiscount = { id: string; name: string; type: string; value: string };
 
+/** Keep only the exact approved discount that staff originally authorized. */
+export function validatePendingDiscount(
+  discount: PendingDiscount | null,
+  discounts: Array<PendingDiscount & { status: string }>
+): PendingDiscount | null {
+  if (!discount || discount.id === "exact_amount") return discount;
+  return discounts.some((d) =>
+    String(d.id) === String(discount.id) && d.status === "approved" &&
+    d.value === discount.value && d.type === discount.type
+  ) ? discount : null;
+}
+
 export type PendingBillAdjustments = {
   appliedDiscount: PendingDiscount | null;
   selectedPaymentMethod: string;
