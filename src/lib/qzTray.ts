@@ -24,9 +24,9 @@ const QZ_CDN = "https://cdn.jsdelivr.net/npm/qz-tray@2.2.5/qz-tray.js";
 
 export function isQzTrayEnabled(): boolean {
   try {
-    return localStorage.getItem(QZ_TRAY_ENABLED_KEY) === "1";
+    return localStorage.getItem(QZ_TRAY_ENABLED_KEY) !== "0";
   } catch {
-    return false;
+    return true;
   }
 }
 

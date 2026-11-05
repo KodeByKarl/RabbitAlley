@@ -4,6 +4,8 @@
 
 When **Use QZ Tray** is enabled in **Settings**, customer receipts, department chits (Bar / Kitchen / LD), and cashier order slips are printed **from the browser** through [QZ Tray](https://qz.io/) on that PC. The API only returns ESC/POS data (base64); the actual print goes to a local USB or Windows printer.
 
+QZ Tray is enabled by default on new browser setups. Existing PCs retain their saved selection; enable it in Settings if it was previously switched off. POS receipts, reprints, order slips, and running bills never fall back to the browser Print dialog. If printing fails, check QZ Tray and the assigned printer, then retry. Each customer receipt is sent as one raw job with a single cut after the footer, including long bills.
+
 ## Setup
 
 1. Install **QZ Tray** on each POS/cashier PC: https://qz.io/download/

@@ -549,50 +549,6 @@ function TableOrder() {
     [table, user?.name]
   );
 
-  const printOrderSlipPreview = useCallback(
-    async (items: OrderItem[], orderId: string, opts?: { isReprint?: boolean }) => {
-      if (!table || items.length === 0) return false;
-      const slipBody = buildOrderSlipPayload(items, orderId, opts);
-      let html = "";
-      try {
-        html = await api.print.orderSlipHtml(slipBody as Record<string, unknown>);
-      } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Failed to load order slip preview");
-        return false;
-      }
-
-      const printWindow = window.open("", "_blank", "width=400,height=1000,scrollbars=yes");
-      if (!printWindow) {
-        toast.error("Print preview was blocked. Allow popups for this site and try again.");
-        return false;
-      }
-
-      printWindow.document.write(html);
-      printWindow.document.close();
-      const triggerPrint = () => {
-        printWindow.onafterprint = () => {
-          try {
-            printWindow.close();
-          } catch {
-            /* no-op */
-          }
-        };
-        printWindow.print();
-      };
-      if (printWindow.document.readyState === "complete") {
-        printWindow.focus();
-        setTimeout(triggerPrint, 120);
-      } else {
-        printWindow.onload = () => {
-          printWindow.focus();
-          setTimeout(triggerPrint, 120);
-        };
-      }
-      return true;
-    },
-    [table, buildOrderSlipPayload]
-  );
-
   // Must be called unconditionally (before any early return) to satisfy Rules of Hooks
   const printCashierOrderSlip = useCallback(
     async (items: OrderItem[], orderId: string, opts?: { silent?: boolean; isReprint?: boolean }) => {
@@ -645,25 +601,9 @@ function TableOrder() {
     const orderNumber = formatOrderDisplayNumber(tab.orderNumber, tab.id);
     const tabLabel = formatOrderTabLabel(tab.orderNumber, tab.id);
 
-    // Print once: thermal when configured, otherwise browser preview. Never both (double print).
-    const printerName = getPrinterForJob("order_slip");
-    if (printerName?.trim()) {
-      const printed = await printCashierOrderSlip(printableItems, orderNumber, {
-        silent: true,
-        isReprint: true,
-      });
-      if (printed) {
-        toast.success(`Order slip reprinted (${tabLabel})`);
-        return;
-      }
-      toast.warning(`Thermal reprint failed (${tabLabel}). Opening browser preview…`);
-    }
-
-    const previewOpened = await printOrderSlipPreview(printableItems, orderNumber, { isReprint: true });
-    if (previewOpened) {
-      toast.info(`Order slip preview opened (${tabLabel}). Select your printer in the dialog.`);
-    }
-  }, [orderTabs, activeTabIndex, printOrderSlipPreview, printCashierOrderSlip]);
+    const printed = await printCashierOrderSlip(printableItems, orderNumber, { isReprint: true });
+    if (printed) toast.success(`Order slip reprinted (${tabLabel})`);
+  }, [orderTabs, activeTabIndex, printCashierOrderSlip]);
 
   const orderTabRows = useMemo(() => {
     const rows: Array<Array<{ tab: OrderTab; idx: number }>> = [];
@@ -677,8 +617,8 @@ function TableOrder() {
 
   const sendPreviewNow = useMemo(() => new Date(), [sendToDeptOpen]);
 
-  const printReceiptViaBrowser = useCallback(
-    (receipt: {
+  const printPaymentReceipt = useCallback(
+    async (receipt: {
       orderNumber: string;
       date: string;
       time: string;
@@ -705,159 +645,26 @@ function TableOrder() {
       isReprint?: boolean;
       originalPaymentMethod?: string | null;
     }) => {
-      const printWindow = window.open("", "_blank", "width=400,height=1000,scrollbars=yes");
-      if (!printWindow) {
-        toast.error("Receipt print window was blocked. Allow popups for this site and try again, or use the browser Print menu.");
-        return;
+      const printerName = getPrinterForJob("payment_receipt");
+      if (!printerName?.trim()) {
+        toast.error("Payment receipt printer not set. Configure it in Settings.");
+        return false;
       }
-
-      const businessName = receipt.businessName?.trim() || "";
-      const businessAddress = receipt.businessAddress?.trim() || "";
-      const businessContact = receipt.businessContact?.trim() || "";
-      const receiptFooterText = receipt.receiptFooter?.trim() || "";
-      const vatTinText = receipt.vatTin?.trim() || "";
-      const isReprint =
-        receipt.isReprint === true ||
-        receipt.paymentMethod === "Reprint" ||
-        receipt.paymentMethod === "REPRINT";
-      const paymentDisplay = (() => {
-        if (!isReprint) return String(receipt.paymentMethod || "—").toUpperCase();
-        const original = receipt.originalPaymentMethod || receipt.paymentMethod;
-        if (!original || /^reprint$/i.test(String(original))) return "—";
-        return String(original).toUpperCase();
-      })();
-      const receiptChange = Math.max(
-        0,
-        Number(
-          receipt.change != null
-            ? receipt.change
-            : Number(receipt.amountPaid || 0) - Number(receipt.total || 0)
-        )
-      );
-      const showChange = /^CASH$/i.test(paymentDisplay) || /^GCASH$/i.test(paymentDisplay) || receiptChange > 0;
-
-      const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Receipt</title>
-        <style>
-          @page { size: 80mm auto; margin: 3mm 2mm 8mm 2mm; }
-          @media print {
-            html, body { height: auto !important; overflow: visible !important; }
-            .no-break { page-break-inside: avoid; }
-          }
-          * { box-sizing: border-box; }
-          body {
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            line-height: 1.4;
-            width: 72mm;
-            margin: 0 auto;
-            padding: 6px 4px 0 4px;
-            color: #000;
-            background: #fff;
-          }
-          .center { text-align: center; }
-          .bold { font-weight: bold; }
-          .line { border: none; border-top: 1px dashed #000; margin: 6px 0; }
-          .row {
-            display: table;
-            width: 100%;
-            margin: 1.5px 0;
-          }
-          .row .lbl {
-            display: table-cell;
-            width: 60%;
-            word-break: break-word;
-          }
-          .row .val {
-            display: table-cell;
-            width: 40%;
-            text-align: right;
-            white-space: nowrap;
-            padding-left: 4px;
-          }
-          .row.total-row { font-weight: bold; font-size: 13px; }
-          .item-note { margin-left: 1.5em; font-size: 10px; color: #444; margin-bottom: 1px; }
-          h1 { margin: 0 0 2px 0; font-size: 15px; font-weight: bold; }
-          .biz-sub { font-size: 10px; margin: 1px 0; }
-          .reprint-banner {
-            text-align: center;
-            font-weight: bold;
-            font-size: 10px;
-            letter-spacing: 0.12em;
-            border: 1px solid #000;
-            padding: 2px 4px;
-            margin: 4px 0;
-          }
-          .footer-note { font-size: 10px; margin: 2px 0; }
-          .bottom-pad { height: 10mm; }
-        </style>
-      </head>
-      <body>
-        <div class="center no-break">
-          ${businessName ? `<h1>${businessName}</h1>` : ""}
-          ${businessAddress ? `<div class="biz-sub">${businessAddress}</div>` : ""}
-          ${businessContact ? `<div class="biz-sub">${businessContact}</div>` : ""}
-        </div>
-        ${isReprint ? `<div class="reprint-banner">** REPRINT COPY **</div>` : ""}
-        <div class="line"></div>
-        <div class="row"><span class="lbl">Order #:</span><span class="val">${receipt.orderNumber}</span></div>
-        <div class="row"><span class="lbl">Date:</span><span class="val">${receipt.date}</span></div>
-        <div class="row"><span class="lbl">Time:</span><span class="val">${receipt.time}</span></div>
-        <div class="row"><span class="lbl">Table:</span><span class="val">${receipt.table}</span></div>
-        <div class="row"><span class="lbl">Cashier:</span><span class="val">${receipt.cashier}</span></div>
-        <div class="line"></div>
-        <div class="bold" style="margin-bottom:3px;">ITEMS</div>
-        ${receipt.items.map(item => `
-          <div class="row">
-            <span class="lbl">${item.quantity}x ${item.name}</span>
-            <span class="val">${item.subtotal === 0 ? "0.00" : "₱" + item.subtotal.toFixed(2)}</span>
-          </div>
-          ${item.note ? `<div class="item-note">Note: ${item.note}</div>` : ""}
-        `).join("")}
-        <div class="line"></div>
-        <div class="row"><span class="lbl">Subtotal:</span><span class="val">₱${receipt.subtotal.toFixed(2)}</span></div>
-        ${receipt.complimentary ? `<div class="row"><span class="lbl">Less Compli:</span><span class="val">-₱${receipt.complimentary.toFixed(2)}</span></div>` : ""}
-        ${receipt.discount ? `<div class="row"><span class="lbl">Discount:</span><span class="val">-₱${receipt.discount.toFixed(2)}</span></div>` : ""}
-        <div class="row"><span class="lbl">${receipt.serviceLabel || serviceLabel}:</span><span class="val">₱${receipt.serviceCharge.toFixed(2)}</span></div>
-        <div class="row"><span class="lbl">${receipt.taxLabel || taxLabel}:</span><span class="val">₱${receipt.tax.toFixed(2)}</span></div>
-        ${receipt.cardSurcharge ? `<div class="row"><span class="lbl">Card Fee (${posSettings.cardSurcharge.toFixed(2).replace(/\.00$/, "")}%):</span><span class="val">₱${receipt.cardSurcharge.toFixed(2)}</span></div>` : ""}
-        <div class="line"></div>
-        <div class="row total-row"><span class="lbl">TOTAL:</span><span class="val">₱${receipt.total.toFixed(2)}</span></div>
-        <div class="line"></div>
-        <div class="row"><span class="lbl">Payment:</span><span class="val">${paymentDisplay}</span></div>
-        <div class="row"><span class="lbl">Amount Paid:</span><span class="val">₱${receipt.amountPaid.toFixed(2)}</span></div>
-        ${showChange ? `<div class="row"><span class="lbl">Change:</span><span class="val">₱${receiptChange.toFixed(2)}</span></div>` : ""}
-        <div class="line"></div>
-        <div class="center">
-          ${receiptFooterText ? `<div class="bold footer-note">${receiptFooterText}</div>` : ""}
-          <div class="footer-note">Please come again</div>
-          <br>
-          <div class="footer-note bold">This serves as your OFFICIAL RECEIPT</div>
-          ${vatTinText ? `<div class="footer-note">VAT Reg TIN: ${vatTinText}</div>` : ""}
-          ${isReprint ? `<div class="footer-note" style="margin-top:4px;">** REPRINT — NOT A DUPLICATE CHARGE **</div>` : ""}
-        </div>
-        <div class="bottom-pad"></div>
-      </body>
-      </html>
-    `;
-
-      printWindow.document.write(html);
-      printWindow.document.close();
-      const triggerPrint = () => {
-        printWindow.print();
-        printWindow.close();
-      };
-      if (printWindow.document.readyState === "complete") {
-        printWindow.focus();
-        setTimeout(triggerPrint, 100);
-      } else {
-        printWindow.onload = () => { printWindow.focus(); setTimeout(triggerPrint, 100); };
+      try {
+        if (isQzTrayEnabled()) {
+          const { base64 } = await api.print.qzPayload.receipt(receipt as Record<string, unknown>);
+          await qzPrintRawBase64(printerName, base64);
+        } else {
+          const result = await api.print.receipt(receipt, printerName);
+          if (!result.ok) throw new Error(result.error || "Printer error");
+        }
+        return true;
+      } catch (e) {
+        toast.error(`Receipt not printed: ${e instanceof Error ? e.message : "Start QZ Tray and check the printer in Settings."}`);
+        return false;
       }
     },
-    [serviceLabel, taxLabel, posSettings.cardSurcharge]
+    []
   );
 
   const printOfficialReprintReceipt = useCallback(
@@ -890,26 +697,9 @@ function TableOrder() {
         change: Number(receipt.change ?? 0),
         isReprint: true,
       };
-      const printerName = getPrinterForJob("payment_receipt") || undefined;
-      if (!printerName?.trim()) {
-        printReceiptViaBrowser(receiptData);
-        return false;
-      }
-      try {
-        if (isQzTrayEnabled()) {
-          const { base64 } = await api.print.qzPayload.receipt(receiptData as Record<string, unknown>);
-          await qzPrintRawBase64(printerName, base64);
-          return true;
-        }
-        const result = await api.print.receipt(receiptData, printerName);
-        if (result.ok) return true;
-      } catch {
-        // fall through to browser
-      }
-      printReceiptViaBrowser(receiptData);
-      return false;
+      return printPaymentReceipt(receiptData);
     },
-    [printReceiptViaBrowser]
+    [printPaymentReceipt]
   );
 
   const handleReprintFinalBill = useCallback(
@@ -927,7 +717,7 @@ function TableOrder() {
         if (ids.length === 1) {
           const { receipt } = await api.orders.reprintFinalBill(ids[0], "pos");
           const printed = await printOfficialReprintReceipt(receipt, ids[0]);
-          toast.success(printed ? "Final bill reprint sent to printer" : "Final bill reprint opened in browser");
+          if (printed) toast.success("Final bill reprint sent to printer");
           return;
         }
         const { receipts } = await api.orders.reprintFinalBills(ids, "pos");
@@ -967,11 +757,7 @@ function TableOrder() {
           originalPaymentMethod: mergedPaymentMethods.length === 1 ? mergedPaymentMethods[0] : "Mixed",
         };
         const anyPrinted = await printOfficialReprintReceipt(mergedReceipt as Record<string, unknown>, ids[0]);
-        toast.success(
-          anyPrinted
-            ? "Final bill reprint sent to printer"
-            : "Final bill reprint opened in browser"
-        );
+        if (anyPrinted) toast.success("Final bill reprint sent to printer");
       } catch (e) {
         const err = e as Error & { data?: { code?: string } };
         if (err.data?.code === "ORDER_UNPAID") {
@@ -1655,7 +1441,7 @@ function TableOrder() {
     }
   };
 
-  const printBillSummaryViaBrowser = async () => {
+  const printBillSummary = async () => {
     if (!table || !hasAnySentOrder) {
       toast.error("No sent orders to print");
       return;
@@ -1668,100 +1454,6 @@ function TableOrder() {
     );
     const summaryBusinessName = posSettings.businessName?.trim() || "";
     const summaryAddress = posSettings.address?.trim() || "";
-
-    const itemLines = paymentDisplayItems.map((item) => {
-      const ladySuffix = item.department === "LD" && item.servedByName ? ` [${item.servedByName}]` : "";
-      const compliSuffix = item.isComplimentary ? " (Compli)" : "";
-      const noteSuffix = item.specialRequest ? ` - ${item.specialRequest}` : "";
-      return `
-        <div class="row">
-          <span class="lbl">${item.quantity}x ${item.name}${ladySuffix}${compliSuffix}${noteSuffix}</span>
-          <span class="val">${formatCurrency(item.subtotal)}</span>
-        </div>
-      `;
-    }).join("");
-
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Bill Summary</title>
-        <style>
-          @page { size: 80mm auto; margin: 3mm 2mm 8mm 2mm; }
-          @media print {
-            html, body { height: auto !important; overflow: visible !important; }
-            .no-break { page-break-inside: avoid; }
-          }
-          * { box-sizing: border-box; }
-          body {
-            font-family: 'Courier New', monospace;
-            font-size: 11px;
-            line-height: 1.45;
-            width: 76mm;
-            margin: 0 auto;
-            padding: 6px 4px 0 4px;
-            color: #000;
-            background: #fff;
-          }
-          .center { text-align: center; }
-          .bold { font-weight: bold; }
-          .line { border: none; border-top: 1px dashed #000; margin: 6px 0; }
-          .row {
-            display: table;
-            width: 100%;
-            margin: 1.5px 0;
-          }
-          .row .lbl {
-            display: table-cell;
-            width: 60%;
-            word-break: break-word;
-          }
-          .row .val {
-            display: table-cell;
-            width: 40%;
-            text-align: right;
-            white-space: nowrap;
-            padding-left: 4px;
-          }
-          .row.total-row { font-weight: bold; font-size: 12px; }
-          .note { font-size: 10px; }
-          .bottom-pad { height: 25mm; }
-        </style>
-      </head>
-      <body>
-        <div class="center no-break">
-          ${summaryBusinessName ? `<div class="bold" style="font-size:15px;">${summaryBusinessName}</div>` : ""}
-          ${summaryAddress ? `<div class="note">${summaryAddress}</div>` : ""}
-          <div class="bold" style="margin-top:3px;">BILL SUMMARY</div>
-          <div class="note">NOT OFFICIAL RECEIPT</div>
-        </div>
-        <div class="line"></div>
-        <div class="row"><span class="lbl">Date:</span><span class="val">${nowLocal.toLocaleDateString("en-US", { month: "short", day: "2-digit", year: "numeric" })}</span></div>
-        <div class="row"><span class="lbl">Time:</span><span class="val">${nowLocal.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}</span></div>
-        <div class="row"><span class="lbl">Table:</span><span class="val">${table.area} - ${table.name}</span></div>
-        <div class="row"><span class="lbl">Cashier:</span><span class="val">${user?.name || "Staff"}</span></div>
-        <div class="row"><span class="lbl">Orders:</span><span class="val">${sentOrderIds || "—"}</span></div>
-        <div class="line"></div>
-        <div class="bold" style="margin-bottom:3px;">ITEMS</div>
-        ${itemLines || `<div class="row"><span class="lbl">No items</span><span class="val">0.00</span></div>`}
-        <div class="line"></div>
-        <div class="row"><span class="lbl">Subtotal:</span><span class="val">${formatCurrency(combinedSubtotal)}</span></div>
-        ${combinedComplimentary > 0 ? `<div class="row"><span class="lbl">Less Compli:</span><span class="val">-${formatCurrency(combinedComplimentary)}</span></div>` : ""}
-        ${appliedDiscount ? `<div class="row"><span class="lbl">Discount (${appliedDiscount.name}):</span><span class="val">-${formatCurrency(discountAmount)}</span></div>` : ""}
-        <div class="row"><span class="lbl">${serviceLabel}:</span><span class="val">${formatCurrency(discountedServiceCharge)}</span></div>
-        <div class="row"><span class="lbl">${taxLabel}:</span><span class="val">${formatCurrency(discountedTax)}</span></div>
-        ${((useSplitPayment && splitCardSurcharge > 0) || (!useSplitPayment && hasCardSurcharge && cardSurcharge > 0))
-          ? `<div class="row"><span class="lbl">Card Fee:</span><span class="val">${formatCurrency(useSplitPayment ? splitCardSurcharge : cardSurcharge)}</span></div>`
-          : ""
-        }
-        <div class="line"></div>
-        <div class="row total-row"><span class="lbl">TOTAL DUE:</span><span class="val">${formatCurrency(finalTotal)}</span></div>
-        <div class="line"></div>
-        <div class="center note">For bill checking before payment only.</div>
-        <div class="bottom-pad"></div>
-      </body>
-      </html>
-    `;
 
     // Build payload for thermal/QZ
     const billPayload = {
@@ -1812,7 +1504,7 @@ function TableOrder() {
         if (result.ok) thermalSent = true;
       }
     } catch {
-      // fallback to browser
+      // Report failure below; never open a browser print dialog.
     }
 
     if (thermalSent) {
@@ -1820,30 +1512,7 @@ function TableOrder() {
       return;
     }
 
-    // Fallback: browser popup (printer assigned but thermal failed)
-    const printWindow = window.open("", "_blank", "width=400,height=1000,scrollbars=yes");
-    if (!printWindow) {
-      toast.error("Print window was blocked. Allow popups for this site and try again.");
-      return;
-    }
-
-    printWindow.document.write(html);
-    printWindow.document.close();
-    const triggerPrint = () => {
-      printWindow.onafterprint = () => {
-        try { printWindow.close(); } catch { /* no-op */ }
-      };
-      printWindow.print();
-    };
-    if (printWindow.document.readyState === "complete") {
-      printWindow.focus();
-      setTimeout(triggerPrint, 120);
-    } else {
-      printWindow.onload = () => {
-        printWindow.focus();
-        setTimeout(triggerPrint, 120);
-      };
-    }
+    toast.error("Running bill not printed. Check QZ Tray and the printer in Settings, then retry.");
   };
 
   return (
@@ -2217,7 +1886,7 @@ function TableOrder() {
                 <Button
                   variant="outline"
                   disabled={!hasAnySentOrder}
-                  onClick={printBillSummaryViaBrowser}
+                  onClick={printBillSummary}
                   title={!hasAnySentOrder ? "Send at least one order first" : "Print running bill before payment"}
                 >
                   <Printer className="w-4 h-4 mr-2" />
@@ -2609,7 +2278,7 @@ function TableOrder() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={printBillSummaryViaBrowser}
+                  onClick={printBillSummary}
                   title="Print total bill summary before payment"
                 >
                   <Printer className="w-3.5 h-3.5 mr-1" />
@@ -3718,7 +3387,7 @@ function TableOrder() {
                   ) : (
                     <>
                       <p className="text-sm text-muted-foreground mb-2">Receipt was not sent to printer automatically.</p>
-                      <p className="text-xs text-muted-foreground mb-2">For <strong>LAN printers</strong>: set <code className="bg-muted px-1 rounded">PRINTER_INTERFACE=tcp://IP:9100</code> in <code className="bg-muted px-1 rounded">server/.env</code> (comma-separated for 3 areas), restart the server, then assign in <strong>Settings</strong>. For USB, click &quot;Print receipt&quot; below and choose the printer in the dialog.</p>
+                      <p className="text-xs text-muted-foreground mb-2">For <strong>LAN printers</strong>: set <code className="bg-muted px-1 rounded">PRINTER_INTERFACE=tcp://IP:9100</code> in <code className="bg-muted px-1 rounded">server/.env</code> (comma-separated for 3 areas), restart the server, then assign in <strong>Settings</strong>. For USB, enable QZ Tray in Settings, select the printer, and make sure QZ Tray is running on this PC.</p>
                     </>
                   )}
                   <div className="flex gap-3 justify-center flex-wrap">
@@ -3737,8 +3406,9 @@ function TableOrder() {
                         type="button"
                         variant="outline"
                         onClick={() => {
-                          printReceiptViaBrowser(lastReceiptForPrint!);
-                          toast.info("In the dialog, select your printer (e.g. XPrinter) then click Print.");
+                          void printPaymentReceipt(lastReceiptForPrint!).then((printed) => {
+                            if (printed) toast.success("Receipt copy sent to printer.");
+                          });
                         }}
                       >
                         <Printer className="w-4 h-4 mr-2" />
