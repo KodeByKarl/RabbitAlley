@@ -1757,23 +1757,8 @@ app.post("/api/dashboard/tables", requireAnyPermission("manage_settings"), async
   const nameTrim = String(name).trim();
   const validAreas = ["Lounge", "Club", "LD"];
   if (!validAreas.includes(area)) return res.status(400).json({ error: "Area must be Lounge, Club, or LD" });
-  /** Soft floor capacity for the floor map. */
-  const MAX_FLOOR_TABLES = 40;
   try {
     const db = await getPool();
-    const [countRows] = await db.execute(
-      "SELECT COUNT(*) AS c FROM pos_tables WHERE branch_id = ?",
-      [branchId]
-    );
-    const tableCount = Number(countRows[0]?.c ?? 0);
-    if (tableCount >= MAX_FLOOR_TABLES) {
-      return res.status(400).json({
-        error: `Floor has reached maximum capacity of ${MAX_FLOOR_TABLES} tables.`,
-        code: "TABLE_CAPACITY",
-        tableCount,
-        maxTables: MAX_FLOOR_TABLES,
-      });
-    }
     // The id is used as a URL path segment, so keep it to safe characters.
     let id = nameTrim.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 16) || "T";
     const [existing] = await db.execute(

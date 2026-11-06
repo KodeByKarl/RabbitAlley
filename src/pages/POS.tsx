@@ -3,10 +3,8 @@ import { useLocation } from "react-router-dom";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { TableGrid } from "@/components/dashboard/TableGrid";
-import { FloorCapacityBanner } from "@/components/dashboard/FloorCapacityBanner";
 import { useAuth } from "@/contexts/AuthContext";
 import { isFloorWaiter } from "@/lib/floorStaff";
-import { countFloorTables, isFloorAtTableCapacity, MAX_FLOOR_TABLES } from "@/lib/tableCapacity";
 import { api } from "@/lib/api";
 import { mapApiTable } from "@/types/pos";
 import type { Table } from "@/types/pos";
@@ -59,7 +57,6 @@ export default function POS() {
   const [transferring, setTransferring] = useState(false);
 
   const posDisplayAreas = ["Lounge", "Club"] as const;
-  const floorTableCount = countFloorTables(tables);
 
   const loadTables = async () => {
     setLoading(true);
@@ -82,12 +79,6 @@ export default function POS() {
     e.preventDefault();
     if (!addName.trim()) {
       toast.error("Table name is required");
-      return;
-    }
-    if (isFloorAtTableCapacity(floorTableCount)) {
-      toast.error(
-        `Floor has reached maximum capacity of ${MAX_FLOOR_TABLES} tables.`
-      );
       return;
     }
     setSaving(true);
@@ -261,15 +252,7 @@ export default function POS() {
         description="Select a table to start or view an order"
       >
         {canAddTable && (
-          <Button
-            onClick={() => setAddTableOpen(true)}
-            disabled={isFloorAtTableCapacity(floorTableCount)}
-            title={
-              isFloorAtTableCapacity(floorTableCount)
-                ? `Maximum table limit reached (${floorTableCount}/${MAX_FLOOR_TABLES} tables).`
-                : undefined
-            }
-          >
+          <Button onClick={() => setAddTableOpen(true)}>
             <Plus className="w-4 h-4 mr-2" />
             Add Table
           </Button>
@@ -287,7 +270,6 @@ export default function POS() {
           </>
         )}
       </PageHeader>
-      {!loading && <FloorCapacityBanner tableCount={floorTableCount} />}
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {posDisplayAreas.map((area) => (
@@ -318,9 +300,7 @@ export default function POS() {
           <DialogHeader>
             <DialogTitle>Add Table</DialogTitle>
             <p className="text-sm text-muted-foreground">
-              {isFloorAtTableCapacity(floorTableCount)
-                ? `Maximum table limit reached (${floorTableCount}/${MAX_FLOOR_TABLES} tables).`
-                : `Extend your floor with a new table (${floorTableCount}/${MAX_FLOOR_TABLES}). It will appear in the selected area.`}
+              Extend your floor with a new table. It will appear in the selected area.
             </p>
           </DialogHeader>
           <form onSubmit={handleAddTable} className="space-y-4">
@@ -331,7 +311,6 @@ export default function POS() {
                 value={addName}
                 onChange={(e) => setAddName(e.target.value)}
                 placeholder="e.g. L7, C9, LD5"
-                disabled={isFloorAtTableCapacity(floorTableCount)}
               />
             </div>
             <div className="space-y-2">
@@ -339,7 +318,6 @@ export default function POS() {
               <Select
                 value={addArea}
                 onValueChange={(v) => setAddArea(v as "Lounge" | "Club")}
-                disabled={isFloorAtTableCapacity(floorTableCount)}
               >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -351,7 +329,7 @@ export default function POS() {
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setAddTableOpen(false)}>Cancel</Button>
-              <Button type="submit" disabled={saving || isFloorAtTableCapacity(floorTableCount)}>
+              <Button type="submit" disabled={saving}>
                 {saving ? "Adding…" : "Add Table"}
               </Button>
             </DialogFooter>
