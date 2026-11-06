@@ -1,3 +1,6 @@
+import { printDocument } from "@/lib/printDocument";
+import { isQzTrayEnabled, qzPrintRawBase64 } from "@/lib/qzTray";
+import { getPrinterForJob } from "@/lib/storage-keys";
 import { Fragment, useCallback, useEffect, useMemo, useState, memo } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { PageHeader } from "@/components/layout/PageHeader";
@@ -882,19 +885,16 @@ export default function Reports() {
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "Could not save to prints folder");
       }
-      const win = window.open("", "_blank", "width=800,height=900");
-      if (win) {
-        win.document.write(html);
-        win.document.close();
-        win.focus();
-        setTimeout(() => win.print(), 200);
-      }
+      await printDocument(html);
       await new Promise((r) => setTimeout(r, 2000));
       setProductPrintStep("done");
       await new Promise((r) => setTimeout(r, 1200));
       toast.success("Product report saved & printed");
       setProductPrintOpen(false);
-    })();
+    })().catch((e) => {
+      setProductPrintOpen(false);
+      toast.error(e instanceof Error ? e.message : "Report not printed");
+    });
   }, [productRows, productSummary, dateFrom, dateTo]);
 
   const loadVoidsReport = useCallback(async () => {
@@ -975,19 +975,16 @@ export default function Reports() {
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "Could not save to prints folder");
       }
-      const win = window.open("", "_blank", "width=900,height=900");
-      if (win) {
-        win.document.write(html);
-        win.document.close();
-        win.focus();
-        setTimeout(() => win.print(), 200);
-      }
+      await printDocument(html);
       await new Promise((r) => setTimeout(r, 2000));
       setVoidPrintStep("done");
       await new Promise((r) => setTimeout(r, 1200));
       toast.success("Void report saved & printed");
       setVoidPrintOpen(false);
-    })();
+    })().catch((e) => {
+      setVoidPrintOpen(false);
+      toast.error(e instanceof Error ? e.message : "Report not printed");
+    });
   }, [voidRows, voidSummary, dateFrom, dateTo]);
 
   const ensureOrderDetail = useCallback(async (orderCode: string) => {
@@ -1127,7 +1124,7 @@ export default function Reports() {
   }, [orderIdFromCode]);
 
   const printFinalBillReceipts = useCallback(
-    (
+    async (
       entries: Array<{
         orderId: string;
         receipt: {
@@ -1161,79 +1158,19 @@ export default function Reports() {
     ) => {
     const mergedEntries = mergeFinalBillReceipts(entries);
     if (!mergedEntries.length) return;
-    entries = mergedEntries;
-    const w = window.open("", "_blank", "width=420,height=980,scrollbars=yes");
-    if (!w) return;
-    const sections = entries.map(({ receipt, orderId }) => {
-      const payRaw = receipt.originalPaymentMethod || receipt.paymentMethod || "";
-      const payLabel = payRaw && !/^reprint$/i.test(payRaw) ? String(payRaw).toUpperCase() : "—";
-      const rows = (receipt.items || [])
-        .map((item) => `
-          <tr>
-            <td>${escapeHtml(item.quantity)}x ${escapeHtml(item.name)}</td>
-            <td class="num">₱${Number(item.subtotal || 0).toFixed(2)}</td>
-          </tr>
-        `)
-        .join("");
-      return `
-        <section class="receipt">
-          <div class="center bold">${escapeHtml(receipt.businessName || "RABBIT ALLEY")}</div>
-          ${receipt.businessAddress ? `<div class="center">${escapeHtml(receipt.businessAddress)}</div>` : ""}
-          ${receipt.businessContact ? `<div class="center">${escapeHtml(receipt.businessContact)}</div>` : ""}
-          <hr />
-          <div class="center bold">OFFICIAL RECEIPT</div>
-          <div class="center reprint">** REPRINT COPY **</div>
-          <hr />
-          <div>Order: ${escapeHtml(receipt.orderNumber || orderId)}</div>
-          <div>Date: ${escapeHtml(receipt.date)} ${escapeHtml(receipt.time)}</div>
-          <div>Table: ${escapeHtml(receipt.table)}</div>
-          <div>Cashier: ${escapeHtml(receipt.cashier)}</div>
-          <hr />
-          <table><tbody>${rows}</tbody></table>
-          <hr />
-          <div class="line"><span>Subtotal</span><span>₱${Number(receipt.subtotal || 0).toFixed(2)}</span></div>
-          ${receipt.complimentary ? `<div class="line"><span>Less Compli</span><span>-₱${Number(receipt.complimentary).toFixed(2)}</span></div>` : ""}
-          ${receipt.discount ? `<div class="line"><span>Discount</span><span>-₱${Number(receipt.discount).toFixed(2)}</span></div>` : ""}
-          <div class="line"><span>${escapeHtml(receipt.serviceLabel || "Service")}</span><span>₱${Number(receipt.serviceCharge || 0).toFixed(2)}</span></div>
-          <div class="line"><span>${escapeHtml(receipt.taxLabel || "Tax")}</span><span>₱${Number(receipt.tax || 0).toFixed(2)}</span></div>
-          ${receipt.cardSurcharge ? `<div class="line"><span>Card Fee</span><span>₱${Number(receipt.cardSurcharge).toFixed(2)}</span></div>` : ""}
-          <hr />
-          <div class="line bold"><span>TOTAL</span><span>₱${Number(receipt.total || 0).toFixed(2)}</span></div>
-          <div class="line"><span>Payment</span><span>${escapeHtml(payLabel)}</span></div>
-          <div class="line"><span>Amount Paid</span><span>₱${Number(receipt.amountPaid || receipt.total || 0).toFixed(2)}</span></div>
-          <div class="line"><span>Change</span><span>₱${Number(receipt.change || 0).toFixed(2)}</span></div>
-          ${receipt.receiptFooter ? `<div class="center footer">${escapeHtml(receipt.receiptFooter)}</div>` : ""}
-          ${receipt.vatTin ? `<div class="center">VAT TIN: ${escapeHtml(receipt.vatTin)}</div>` : ""}
-          <div class="center reprint footer">** REPRINT — NOT A DUPLICATE **</div>
-        </section>
-      `;
-    }).join("");
-    w.document.write(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>Receipt Reprint</title>
-          <style>
-            @page { size: 80mm auto; margin: 3mm 2mm 8mm 2mm; }
-            body { margin: 0; padding: 0; font-family: 'Courier New', monospace; font-size: 11px; color: #000; background: #fff; }
-            .receipt { width: 76mm; margin: 0 auto; padding: 5px 3px 12mm; page-break-inside: avoid; }
-            .center { text-align: center; }
-            .bold { font-weight: 700; }
-            .reprint { margin-top: 2px; font-weight: 700; }
-            .line { display: flex; justify-content: space-between; gap: 8px; margin: 2px 0; }
-            table { width: 100%; border-collapse: collapse; }
-            td { padding: 1px 0; vertical-align: top; }
-            td.num { text-align: right; white-space: nowrap; }
-            hr { border: none; border-top: 1px dashed #000; margin: 6px 0; }
-            .footer { margin-top: 6px; }
-          </style>
-        </head>
-        <body>${sections}</body>
-      </html>
-    `);
-    w.document.close();
-    w.focus();
-    setTimeout(() => { w.print(); w.close(); }, 250);
+    const printerName = getPrinterForJob("payment_receipt");
+    if (!printerName) throw new Error("Payment receipt printer not set. Configure it in Settings.");
+    for (const { receipt } of mergedEntries) {
+      if (isQzTrayEnabled()) {
+        const { base64 } = await api.print.qzPayload.receipt({ ...receipt, isReprint: true });
+        await qzPrintRawBase64(printerName, base64);
+      } else {
+        const result = await api.print.receipt(
+          { ...receipt, isReprint: true } as Parameters<typeof api.print.receipt>[0], printerName
+        );
+        if (!result.ok) throw new Error(result.error || "Receipt not printed");
+      }
+    }
   }, []);
 
   const handlePrintTransaction = useCallback(async (group: SalesGroupRow) => {
@@ -1248,11 +1185,11 @@ export default function Reports() {
     try {
       const orderIds = group.orders.map((order) => orderIdFromCode(order.id));
       const { receipts } = await api.orders.reprintFinalBills(orderIds, "sales_report");
-      printFinalBillReceipts(receipts);
+      await printFinalBillReceipts(receipts);
       toast.success(
         receipts.length > 1
           ? `Final bill reprint: 1 receipt for ${receipts.length} orders`
-          : "Final bill reprint opened"
+          : "Final bill sent to printer"
       );
       return;
     } catch (e) {
@@ -1516,9 +1453,7 @@ export default function Reports() {
     }
   }, [user?.id, loadPayrollStable]);
 
-  const handlePrintPayslip = useCallback((row: PayrollRow) => {
-    const printWindow = window.open("", "_blank", "width=520,height=680");
-    if (!printWindow) return;
+  const handlePrintPayslip = useCallback(async (row: PayrollRow) => {
 
     const dateTimeIn = `${dateFrom} to ${dateTo}`;
     const ldCountLive = row.ldCountRealtime ?? row.ldCount ?? 0;
@@ -1600,12 +1535,12 @@ export default function Reports() {
       </html>
     `;
 
-    printWindow.document.write(html);
-    printWindow.document.close();
-    printWindow.onload = () => {
-      printWindow.print();
-      printWindow.close();
-    };
+    try {
+      await printDocument(html);
+      toast.success("Payslip sent to printer");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Payslip not printed");
+    }
   }, [dateFrom, dateTo]);
 
   const handleDownloadPayslipPdf = useCallback((row: PayrollRow) => {
@@ -1710,7 +1645,7 @@ export default function Reports() {
   const handlePrintPayslipThermal = useCallback(async (row: PayrollRow) => {
     const ldCountLive = row.ldCountRealtime ?? row.ldCount ?? 0;
     try {
-      const res = await api.print.payslip({
+      const payslip = {
         employeeId: row.employeeId,
         name: row.name,
         periodFrom: dateFrom,
@@ -1730,9 +1665,17 @@ export default function Reports() {
         netPayout: row.netPayout,
         status: row.status,
         approvedBy: row.approvedBy ?? undefined,
-      });
-      if (res.ok) toast.success("Payslip sent to thermal printer");
-      else toast.warning(res.fallback ? "Printer unavailable; use Print or Download PDF" : res.error ?? "Print failed");
+      };
+      if (isQzTrayEnabled()) {
+        const printerName = getPrinterForJob("payment_receipt");
+        if (!printerName) throw new Error("Payment receipt printer not set. Configure it in Settings.");
+        const { base64 } = await api.print.qzPayload.payslip(payslip);
+        await qzPrintRawBase64(printerName, base64);
+      } else {
+        const result = await api.print.payslip(payslip);
+        if (!result.ok) throw new Error(result.error || "Payslip not printed");
+      }
+      toast.success("Payslip sent to thermal printer");
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to print payslip");
     }
@@ -2872,8 +2815,8 @@ export default function Reports() {
                           orderIdFromCode(orderDetail.id),
                           "order_detail"
                         );
-                        printFinalBillReceipts([{ orderId, receipt: receipt as Parameters<typeof printFinalBillReceipts>[0][0]["receipt"] }]);
-                        toast.success("Final bill reprint opened");
+                        await printFinalBillReceipts([{ orderId, receipt: receipt as Parameters<typeof printFinalBillReceipts>[0][0]["receipt"] }]);
+                        toast.success("Final bill sent to printer");
                         return;
                       } catch (e) {
                         toast.error(e instanceof Error ? e.message : "No final bill on file for this transaction");
@@ -2884,12 +2827,10 @@ export default function Reports() {
                       toast.error("Only Cashier or Manager can reprint the final bill");
                       return;
                     }
-                    const w = window.open("", "_blank", "width=520,height=700");
-                    if (!w) return;
                     const itemsRows = orderDetail.items.map((i) =>
                       `<tr><td>${i.name}${i.isComplimentary ? " (Compli)" : ""}${i.isVoided ? " (VOIDED)" : ""}</td><td class="text-center">${i.quantity}</td><td class="text-right">${formatCurrency(i.unitPrice)}</td><td class="text-right">${formatCurrency(i.subtotal)}</td></tr>`
                     ).join("");
-                    w.document.write(`
+                    const html = `
                       <!DOCTYPE html><html><head><title>Order #${orderDetail.id}</title><style>
                         body{font-family:system-ui,sans-serif;padding:16px;font-size:13px;}
                         table{width:100%;border-collapse:collapse;} th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;}
@@ -2901,11 +2842,13 @@ export default function Reports() {
                         <table class="mt"><thead><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Subtotal</th></tr></thead><tbody>${itemsRows}</tbody></table>
                         <p class="mt bold">Subtotal: ${formatCurrency(orderDetail.subtotal)} · Tax: ${formatCurrency(orderDetail.tax)} · Total: ${formatCurrency(orderDetail.total)}</p>
                         <p class="mt">Status: ${orderDetail.status.toUpperCase()}</p>
-                      </body></html>`
-                    );
-                    w.document.close();
-                    w.focus();
-                    setTimeout(() => { w.print(); w.close(); }, 250);
+                      </body></html>`;
+                    try {
+                      await printDocument(html);
+                      toast.success("Order sent to printer");
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : "Order not printed");
+                    }
                   }}
                 >
                   <Printer className="w-4 h-4 mr-2" />

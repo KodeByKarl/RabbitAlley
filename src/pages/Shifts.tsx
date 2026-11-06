@@ -1,3 +1,4 @@
+import { printDocument } from "@/lib/printDocument";
 import { useEffect, useState, useCallback } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { AppLayout } from "@/components/layout/AppLayout";
@@ -331,12 +332,7 @@ export default function Shifts() {
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "Could not save to prints folder");
       }
-      const win = window.open("", "_blank", "width=400,height=600");
-      if (win) {
-        win.document.write(html);
-        win.document.close();
-        win.print();
-      }
+      await printDocument(html);
 
       await new Promise((r) => setTimeout(r, 2000));
       setReportPrintStep("done");
@@ -344,7 +340,11 @@ export default function Shifts() {
       toast.success("Report saved & printed!");
       setReportPrintOpen(false);
       setReportPrintData(null);
-    })();
+    })().catch((e) => {
+      setReportPrintOpen(false);
+      setReportPrintData(null);
+      toast.error(e instanceof Error ? e.message : "Report not printed");
+    });
   };
 
   const variance = shiftSummary ? calculateCashCountTotal() - shiftSummary.expectedCash : 0;

@@ -11,7 +11,7 @@ declare global {
       websocket: { connect: (o?: object) => Promise<void>; disconnect: () => void; isActive: () => boolean };
       printers: { find: (query?: string) => Promise<string[]>; getDefault: () => Promise<string> };
       configs: { create: (name: string, opts?: object) => object };
-      print: (config: object, data: Array<{ type: string; format: string; data: string }>) => Promise<void>;
+      print: (config: object, data: Array<{ type: string; format: string; flavor?: string; data: string }>) => Promise<void>;
       security: {
         setCertificatePromise: (fn: (resolve: (v: string) => void, reject: (e: Error) => void) => void) => void;
         setSignaturePromise: (fn: (toSign: string) => (resolve: (sig: string) => void, reject: (e: Error) => void) => void) => void;
@@ -76,4 +76,14 @@ export async function qzPrintRawBase64(printerName: string, base64: string): Pro
   const qz = window.qz!;
   const config = qz.configs.create(printerName.trim(), { encoding: "null", rasterize: false });
   await qz.print(config, [{ type: "raw", format: "base64", data: base64 }]);
+}
+
+/** Print an HTML document through QZ without opening a browser window. */
+export async function qzPrintHtml(printerName: string, html: string): Promise<void> {
+  if (!printerName?.trim()) throw new Error("No printer selected");
+  if (!isQzTrayEnabled()) throw new Error("Enable QZ Tray in Settings to print reports without a browser window.");
+  await qzConnect();
+  const qz = window.qz!;
+  const config = qz.configs.create(printerName.trim(), { scaleContent: false });
+  await qz.print(config, [{ type: "pixel", format: "html", flavor: "plain", data: html }]);
 }
